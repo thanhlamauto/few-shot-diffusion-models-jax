@@ -207,11 +207,12 @@ def encode_set(
         # flatten and average
         b, ns = x_set.shape[:2]
         x_flat = x_set.reshape(b * ns, *x_set.shape[2:])
-        out = encoder.apply(params_enc, x_flat, train=train)
-        hc = out["hc"].reshape(b, ns, -1).mean(axis=1)
+        # encoder returns just hc for __call__
+        hc_flat = encoder.apply(params_enc, x_flat, train=train)
+        hc = hc_flat.reshape(b, ns, -1).mean(axis=1)
     else:
-        out = encoder.apply(params_enc, x_set, train=train)
-        hc = out["hc"]
+        # encoder returns (hc, patches, cls) for forward_set
+        hc, _, _ = encoder.apply(params_enc, x_set, train=train)
         if hc.ndim == 3:
             hc = hc.mean(axis=1)
     return hc

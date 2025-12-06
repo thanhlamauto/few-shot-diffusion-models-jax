@@ -171,7 +171,7 @@ class ViT(nn.Module):
 
         x = self.cls_norm(x)
         x = self.cls_dense(x)
-        return {'hc': x}
+        return x
 
     # tương đương forward_set(self, img, t_emb=None, c_old=None)
     def forward_set(
@@ -283,8 +283,5 @@ class ViT(nn.Module):
             x_vec = x_vec + c_old
         hc = self.cls_dense(x_vec)
 
-        return {
-            'hc': hc,
-            'patches': x_set,
-            'cls': x_set[:, 0],
-        }
+        # Return tuple instead of dict for JAX tracing compatibility
+        return hc, x_set, x_set[:, 0]

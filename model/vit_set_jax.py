@@ -308,8 +308,5 @@ class sViT(nn.Module):
             x_out = x_out + c_old
         hc = self.mlp_dense(x_out)
 
-        return {
-            "hc": hc,
-            "patches": x_set,
-            "cls": x_set[:, 0],
-        }
+        # Return tuple instead of dict for JAX tracing compatibility
+        return hc, x_set, x_set[:, 0]
