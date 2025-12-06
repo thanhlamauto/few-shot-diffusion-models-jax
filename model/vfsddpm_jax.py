@@ -23,8 +23,8 @@ from model.set_diffusion.script_util_jax import (
 from model.set_diffusion.dit_jax import DiT
 from model.set_diffusion.gaussian_diffusion_jax import GaussianDiffusion
 from model.set_diffusion.nn_jax import mean_flat
-from vit_set_jax import sViT
-from vit_jax import ViT
+from model.vit_set_jax import sViT
+from model.vit_jax import ViT
 
 
 Array = jnp.ndarray
