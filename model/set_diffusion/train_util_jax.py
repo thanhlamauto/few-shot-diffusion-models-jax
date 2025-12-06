@@ -175,7 +175,7 @@ def create_train_state_pmap(
 
 
 def _tree_update_ema(ema_params, params, rate: float):
-    return jax.tree_map(lambda e, p: update_ema(e, p, rate=rate), ema_params, params)
+    return jax.tree.map(lambda e, p: update_ema(e, p, rate=rate), ema_params, params)
 
 
 def shard_batch(batch: Array, n_devices: int) -> Array:
