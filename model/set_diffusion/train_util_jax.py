@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax.training import train_state
+from flax import struct
 
 from .nn_jax import update_ema, mean_flat
 
@@ -147,7 +148,7 @@ def sample(
 # ----------------------- Pmap multi-device utilities ----------------------- #
 
 
-class TrainStatePmap:
+class TrainStatePmap(struct.PyTreeNode):
     """
     Pmap-friendly train state holding params, EMA params, opt state, and step.
     """
