@@ -51,12 +51,11 @@ class LSA(nn.Module):
         # qkv projection
         qkv = nn.Dense(inner_dim * 3, use_bias=False)(x)   # (b, n, 3 * inner_dim)
 
-        # tách q, k, v
-        qkv = qkv.reshape(b, n, 3, self.heads, self.dim_head)
-        q, k, v = jnp.split(qkv, 3, axis=2)
-        q = q.squeeze(2)   # (b, h, n, d)
-        k = k.squeeze(2)
-        v = v.squeeze(2)
+        # tách q, k, v và reshape thành (b, heads, n, dim_head)
+        q, k, v = jnp.split(qkv, 3, axis=-1)  # each: (b, n, inner_dim)
+        q = rearrange(q, 'b n (h d) -> b h n d', h=self.heads)
+        k = rearrange(k, 'b n (h d) -> b h n d', h=self.heads)
+        v = rearrange(v, 'b n (h d) -> b h n d', h=self.heads)
 
         # attention scores
         dots = jnp.einsum('bhid,bhjd->bhij', q, k) * scale  # (b, h, n, n)
@@ -71,7 +70,7 @@ class LSA(nn.Module):
 
         # apply attention
         out = jnp.einsum('bhij,bhjd->bhid', attn, v)        # (b, h, n, d)
-        out = out.reshape(b, n, inner_dim)                  # (b, n, h*d)
+        out = rearrange(out, 'b h n d -> b n (h d)')        # (b, n, inner_dim)
 
         out = nn.Dense(self.dim)(out)
         out = nn.Dropout(self.dropout)(out, deterministic=not train)
