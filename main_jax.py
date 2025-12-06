@@ -123,7 +123,7 @@ def main():
         print(k, getattr(args, k))
     print()
 
-    logger.configure(dir=DIR, mode="training_jax", args=args, tag="jax")
+    logger.configure(dir=DIR, mode="training", args=args, tag="jax")
 
     n_devices = jax.local_device_count()
     if args.batch_size % n_devices != 0:

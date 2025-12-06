@@ -477,11 +477,15 @@ def configure(dir=None, format_strs=None, comm=None, log_suffix="", mode="traini
         lst_name = [args.dataset, args.model, args.encoder_mode, args.mode_conditioning, args.pool, sigma, args.mode_context, tag]
         lst_name = [ i for i in lst_name if i not in ["", None, "None", "none"] ]
         name="_".join(lst_name)
-        if mode not in ["training", "tmp"]:
-            tmp = args.model_path.split("/")[-2]
-            tmp = tmp.split("-")
-            tmp[0] = mode
-            date_str = "-".join(tmp)
+        if mode not in ["training", "tmp", "training_jax"]:
+            # Only parse model_path if it has valid directory structure
+            if args.model_path and "/" in args.model_path:
+                path_parts = args.model_path.split("/")
+                if len(path_parts) >= 2:
+                    tmp = path_parts[-2]
+                    tmp = tmp.split("-")
+                    tmp[0] = mode
+                    date_str = "-".join(tmp)
                     
     if dir is None:
         dir = os.getenv("OPENAI_LOGDIR")
