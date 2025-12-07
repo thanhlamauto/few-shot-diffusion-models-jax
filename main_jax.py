@@ -74,10 +74,10 @@ def eval_loop(p_state, modules, cfg, loader, n_devices, num_batches):
 def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta):
     """
     Minimal sampling: use first batches from loader, build conditioning, and run diffusion.
-    Saves .npz files with samples/cond.
+    Saves .npz files with samples/cond and returns samples for logging.
     """
     if num_batches <= 0:
-        return
+        return None, None
     host_state = jax.device_get(p_state)
     ema_params = host_state.ema_params
     diffusion = modules["diffusion"]
@@ -86,6 +86,9 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta):
     posterior = modules.get("posterior")
 
     it = iter(loader)
+    all_samples = []
+    all_support = []
+
     for i in range(num_batches):
         try:
             batch = next(it)
@@ -104,6 +107,13 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta):
         # save npz
         out_path = os.path.join(DIR, f"samples_{i:03d}.npz")
         np.savez(out_path, samples=np.array(samples), cond=batch_np)
+
+        # Collect for wandb logging
+        all_samples.append(np.array(samples))
+        all_support.append(batch_np)
+
+    return np.concatenate(all_samples, axis=0) if all_samples else None, \
+           np.concatenate(all_support, axis=0) if all_support else None
 
 
 
@@ -235,9 +245,38 @@ def main():
                 eval_loss = eval_loop(p_state, modules, cfg, val_loader, n_devices, args.num_eval_batches)
                 logger.logkv("eval_loss", eval_loss)
                 logger.dumpkvs(global_step)
+
+                # Generate samples and log to wandb
+                samples, support = sample_loop(p_state, modules, cfg, val_loader, args.num_sample_batches, rng, args.use_ddim, args.eta)
+
                 if args.use_wandb:
-                    wandb.log({"eval_loss": eval_loss, "step": global_step})
-                sample_loop(p_state, modules, cfg, val_loader, args.num_sample_batches, rng, args.use_ddim, args.eta)
+                    log_dict = {"eval_loss": eval_loss, "step": global_step}
+
+                    # Log sample images to wandb
+                    if samples is not None and support is not None:
+                        # Take first few samples for logging (max 16)
+                        n_log = min(16, samples.shape[0])
+                        sample_images = []
+
+                        for idx in range(n_log):
+                            # Denormalize from [-1, 1] to [0, 1] if needed
+                            img = samples[idx].transpose(1, 2, 0)  # CHW -> HWC
+                            img = np.clip((img + 1) / 2, 0, 1)  # [-1,1] -> [0,1]
+                            sample_images.append(wandb.Image(img, caption=f"Sample {idx}"))
+
+                        log_dict["samples"] = sample_images
+
+                        # Log support set images
+                        support_images = []
+                        support_flat = support.reshape(-1, *support.shape[2:])  # Flatten (B, ns, C, H, W) -> (B*ns, C, H, W)
+                        for idx in range(min(8, support_flat.shape[0])):
+                            img = support_flat[idx].transpose(1, 2, 0)  # CHW -> HWC
+                            img = np.clip((img + 1) / 2, 0, 1)
+                            support_images.append(wandb.Image(img, caption=f"Support {idx}"))
+
+                        log_dict["support_set"] = support_images
+
+                    wandb.log(log_dict)
 
             # Check stopping conditions
             if (args.lr_anneal_steps and global_step >= args.lr_anneal_steps) or \
