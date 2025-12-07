@@ -180,8 +180,8 @@ def compute_fid_4096(p_state, modules, cfg, val_loader, n_samples, rng, use_ddim
 
         rng, sample_rng = jax.random.split(rng)
         samples = sample_ema(
-            sub, ema_params["dit"], diffusion, model_apply,
-            shape, conditioning=c_cond, use_ddim=use_ddim, eta=eta, rng=sample_rng
+            sample_rng, ema_params["dit"], diffusion, model_apply,
+            shape, conditioning=c_cond, use_ddim=use_ddim, eta=eta
         )
 
         # Convert samples from (bs*ns, C, H, W) to (bs*ns, H, W, C) for InceptionV3
