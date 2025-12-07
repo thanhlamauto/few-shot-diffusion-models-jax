@@ -5,6 +5,7 @@ This script mirrors the structure of main.py but targets vfsddpm_jax.
 """
 
 import argparse
+import dataclasses
 import jax
 import numpy as np
 import flax
@@ -165,7 +166,7 @@ def main():
             "opt_state": host_state.opt_state,
             "step": int(step_int),
             "rng": rng_save,
-            "cfg": cfg,
+            "cfg": dataclasses.asdict(cfg),  # Convert dataclass to dict for Orbax
         }
         checkpointer.save(os.path.join(ckpt_dir, f"ckpt_{step_int:06d}"), ckpt)
 
