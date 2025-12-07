@@ -284,10 +284,15 @@ def main():
         print("Loading InceptionV3 for FID computation...")
         try:
             inception_fn = fid_jax.get_fid_fn()
-            print("InceptionV3 loaded successfully!")
+            if inception_fn is not None:
+                print("InceptionV3 loaded successfully!")
+            else:
+                print("Warning: InceptionV3 could not be loaded.")
+                print("FID computation will be skipped.")
         except Exception as e:
             print(f"Warning: Could not load InceptionV3: {e}")
             print("FID computation will be skipped.")
+            inception_fn = None
 
     # Checkpointing
     checkpointer = ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
