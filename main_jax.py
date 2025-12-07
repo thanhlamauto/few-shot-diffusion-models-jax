@@ -54,8 +54,7 @@ def eval_loop(p_state, modules, cfg, loader, n_devices, num_batches):
     """
     if num_batches <= 0:
         return 0.0
-    host_state = jax.device_get(p_state)
-    params_eval = host_state.ema_params
+    params_eval = flax.jax_utils.unreplicate(p_state.ema_params)
     losses = []
     it = iter(loader)
     for _ in tqdm(range(num_batches), desc="Eval", unit="batch"):
@@ -80,8 +79,7 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta):
     """
     if num_batches <= 0:
         return None, None
-    host_state = jax.device_get(p_state)
-    ema_params = host_state.ema_params
+    ema_params = flax.jax_utils.unreplicate(p_state.ema_params)
     diffusion = modules["diffusion"]
     dit = modules["dit"]
     encoder = modules["encoder"]
