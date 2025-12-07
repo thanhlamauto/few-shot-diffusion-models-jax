@@ -313,6 +313,7 @@ def create_argparser():
         lr_anneal_steps=0,
         max_steps=0,  # 0 means infinite, set to positive number to limit training
         batch_size=16,
+        batch_size_eval=32,
         log_interval=100,
         save_interval=10000,
         num_eval_batches=10,
