@@ -63,7 +63,7 @@ def create_loader(args, split, shuffle, drop_last=False):
         dataset=dataset,
         batch_size=bs,
         shuffle=shuffle,
-        num_workers=1,
+        num_workers=0,  # Set to 0 to avoid JAX fork() deadlock
         drop_last=drop_last,
     )
     while True:
@@ -106,7 +106,7 @@ if __name__ == "__main__":
     args.dataset = "minimagenet"
     args.batch_size = 10
     args.num_classes = 1
-    args.num_workers = 1
+    args.num_workers = 0
     args.sample_size = 5
     args.sample_size_test = 5
 
