@@ -12,6 +12,7 @@ import flax.serialization as serialization
 import orbax.checkpoint as ocp
 import os
 import wandb
+from tqdm import tqdm
 
 from dataset import create_loader
 from model import select_model  # keeps existing namespace for non-JAX 
@@ -193,7 +194,8 @@ def main():
     logger.log("starting training (jax pmap)...")
     global_step = 0
     for epoch in range(10**6):  # effectively infinite unless steps reached
-        for batch in train_loader:
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch")
+        for batch in pbar:
             batch_np = numpy_from_torch(batch)
             try:
                 batch_sharded = shard_batch(batch_np, n_devices)
@@ -209,6 +211,12 @@ def main():
             # host metrics
             metrics_host = jax.tree.map(lambda x: np.array(x).mean(), metrics)
             global_step += 1
+
+            # Update progress bar with metrics
+            pbar.set_postfix({
+                'step': global_step,
+                'loss': f"{metrics_host.get('loss', 0):.4f}" if 'loss' in metrics_host else 'N/A'
+            })
 
             if global_step % args.log_interval == 0:
                 logger.logkv("step", global_step)
