@@ -370,7 +370,7 @@ def main():
                     logger.logkv_mean(k, v)
                 logger.dumpkvs(global_step)
                 if args.use_wandb:
-                    wandb.log({**metrics_host, "step": global_step})
+                    wandb.log(metrics_host, step=global_step)
 
             # Save / Eval / Sample
             if args.save_interval and global_step % args.save_interval == 0:
@@ -385,7 +385,7 @@ def main():
                     p_state, modules, cfg, val_loader, args.num_sample_batches, rng, args.use_ddim, args.eta)
 
                 if args.use_wandb:
-                    log_dict = {"eval_loss": eval_loss, "step": global_step}
+                    log_dict = {"eval_loss": eval_loss}
 
                     # Log sample images to wandb
                     if samples is not None and support is not None:
@@ -430,7 +430,7 @@ def main():
                             log_dict["fid"] = fid_score
 
                 if args.use_wandb:
-                    wandb.log(log_dict)
+                    wandb.log(log_dict, step=global_step)
 
             # Check stopping conditions
             if (args.lr_anneal_steps and global_step >= args.lr_anneal_steps) or \
