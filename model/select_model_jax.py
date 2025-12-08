@@ -40,5 +40,3 @@ def select_model_jax(args, rng: jax.Array) -> Tuple[Dict[str, Any], Dict[str, An
     )
     params, modules = init_models(rng, cfg)
     return params, modules, cfg
-
-
