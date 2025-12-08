@@ -177,7 +177,8 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
         (1, cfg.in_channels, cfg.image_size, cfg.image_size), dtype=jnp.float32
     )
     dummy_t = jnp.zeros((1,), dtype=jnp.int32)
-    dit_params = dit.init(rng_dit, dummy_x, dummy_t, c=None, y=None, train=False)
+    dit_params = dit.init(rng_dit, dummy_x, dummy_t,
+                          c=None, y=None, train=False)
 
     params = {"encoder": enc_params, "dit": dit_params}
     modules = {"encoder": enc, "dit": dit, "diffusion": diffusion}
@@ -213,7 +214,8 @@ def encode_set(
     else:
         # encoder returns (hc, patches, cls) for forward_set
         # Must explicitly call forward_set method (apply() defaults to __call__)
-        hc, _, _ = encoder.apply(params_enc, x_set, train=train, method=encoder.forward_set)
+        hc, _, _ = encoder.apply(
+            params_enc, x_set, train=train, method=encoder.forward_set)
         if hc.ndim == 3:
             hc = hc.mean(axis=1)
     return hc
@@ -313,7 +315,8 @@ def vfsddpm_loss(
 
     # conditioning
     rng_c, rng_loss = jax.random.split(noise_key)
-    c, klc = leave_one_out_c(rng_c, params, modules, batch_set, cfg, train=train)
+    c, klc = leave_one_out_c(rng_c, params, modules,
+                             batch_set, cfg, train=train)
 
     # flatten images
     x = batch_set.reshape(b * ns, *batch_set.shape[2:])
@@ -355,5 +358,3 @@ def example_train_step_usage():
     # ...
     """
     return None
-
-

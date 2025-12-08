@@ -202,7 +202,8 @@ class ViT(nn.Module):
                 patch_tmp = self.to_patch_embedding(patch_tmp)  # (b, np, dim)
                 set_to_patch_embeddings.append(patch_tmp)
 
-            patches = jnp.concatenate(set_to_patch_embeddings, axis=1)  # (b, np*ns, dim)
+            patches = jnp.concatenate(
+                set_to_patch_embeddings, axis=1)  # (b, np*ns, dim)
 
             if self.pool == 'agg':
                 p = patches.shape[1]
@@ -231,14 +232,17 @@ class ViT(nn.Module):
             t_tok = t_tok[:, 0:1, :]  # (b, 1, dim)
 
         # concat cls + t + patches
-        x = jnp.concatenate([cls_tokens, t_tok, patches], axis=1)  # (b, 2+np, dim)
+        x = jnp.concatenate([cls_tokens, t_tok, patches],
+                            axis=1)  # (b, 2+np, dim)
 
         if self.pool == "agg":
             x = x + self.pos_embedding[:, : (np + self.k), :]
         else:
             # repeat pos cho set
-            tmp_pos = self.pos_embedding[:, self.k:, :]          # (1, num_patches, dim)
-            patches_pos = jnp.repeat(tmp_pos, repeats=ns, axis=1) # (1, num_patches*ns, dim)
+            # (1, num_patches, dim)
+            tmp_pos = self.pos_embedding[:, self.k:, :]
+            # (1, num_patches*ns, dim)
+            patches_pos = jnp.repeat(tmp_pos, repeats=ns, axis=1)
 
             cls_pos = self.pos_embedding[:, 0:1, :]
             t_pos = self.pos_embedding[:, 1:2, :]

@@ -44,12 +44,14 @@ class LSA(nn.Module):
         # learnable log temperature (khởi tạo giống dim_head ** -0.5)
         temperature = self.param(
             "temperature",
-            lambda key: jnp.log(jnp.array(self.dim_head ** -0.5, dtype=jnp.float32))
+            lambda key: jnp.log(
+                jnp.array(self.dim_head ** -0.5, dtype=jnp.float32))
         )
         scale = jnp.exp(temperature)
 
         # qkv projection
-        qkv = nn.Dense(inner_dim * 3, use_bias=False)(x)   # (b, n, 3 * inner_dim)
+        # (b, n, 3 * inner_dim)
+        qkv = nn.Dense(inner_dim * 3, use_bias=False)(x)
 
         # tách q, k, v và reshape thành (b, heads, n, dim_head)
         q, k, v = jnp.split(qkv, 3, axis=-1)  # each: (b, n, inner_dim)
@@ -242,8 +244,10 @@ class sViT(nn.Module):
         x = self.to_patch_embedding(img)          # (b, n_patches, dim)
         b, n, _ = x.shape
 
-        cls_tokens = repeat(self.cls_token, "1 n d -> b n d", b=b)  # (b, 1, dim)
-        x = jnp.concatenate([cls_tokens, x], axis=1)                # (b, n+1, dim)
+        cls_tokens = repeat(
+            self.cls_token, "1 n d -> b n d", b=b)  # (b, 1, dim)
+        # (b, n+1, dim)
+        x = jnp.concatenate([cls_tokens, x], axis=1)
 
         x = x + self.pos_embedding[:, : (n + 1), :]
         x = self.emb_dropout_layer(x, deterministic=not train)
@@ -286,7 +290,8 @@ class sViT(nn.Module):
             t_tok = t_tok[:, 0:1, :]                # (b,1,dim)
 
         # concat cls + t + patches
-        x = jnp.concatenate([cls_tokens, t_tok, patches], axis=1)  # (b, n+2, dim)
+        x = jnp.concatenate([cls_tokens, t_tok, patches],
+                            axis=1)  # (b, n+2, dim)
 
         x = x + self.pos_embedding[:, : (n + 2), :]
         x = self.emb_dropout_layer(x, deterministic=not train)

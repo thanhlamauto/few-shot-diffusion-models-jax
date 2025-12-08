@@ -97,7 +97,7 @@ def get_fid_fn():
     return apply_fn
 
 
-def extract_features_batch(inception_fn, images, batch_size=64):
+def extract_features_batch(inception_fn, images, batch_size=128):
     """
     Extract InceptionV3 features from a batch of images.
 
@@ -132,7 +132,7 @@ def extract_features_batch(inception_fn, images, batch_size=64):
     return features
 
 
-def compute_fid(real_images, fake_images, inception_fn=None, batch_size=64):
+def compute_fid(real_images, fake_images, inception_fn=None, batch_size=128):
     """
     Compute FID between real and fake images.
 

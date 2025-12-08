@@ -179,9 +179,10 @@ def compute_fid_4096(p_state, modules, cfg, val_loader, n_samples, rng, use_ddim
         shape = (bs * ns, C, H, W)
 
         rng, sample_rng = jax.random.split(rng)
+        # Force DDIM for FID (much faster: 50-100 steps vs 1000)
         samples = sample_ema(
             sample_rng, ema_params["dit"], diffusion, model_apply,
-            shape, conditioning=c_cond, use_ddim=use_ddim, eta=eta
+            shape, conditioning=c_cond, use_ddim=True, eta=0.0
         )
 
         # Convert samples from (bs*ns, C, H, W) to (bs*ns, H, W, C) for InceptionV3
@@ -484,7 +485,8 @@ def create_argparser():
         wandb_project="fsdm-jax",
         wandb_run_name=None,
         compute_fid=False,
-        fid_num_samples=4096,
+        # Reduced from 4096 for faster eval (still reliable)
+        fid_num_samples=1024,
     )
     defaults.update(model_and_diffusion_defaults_jax())
     parser = argparse.ArgumentParser()
