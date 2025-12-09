@@ -75,6 +75,56 @@ class BaseSetsDataset(data.Dataset):
             'inputs': sets,
             'targets': set_labels
         }
+        
+        # Verify single-class constraint
+        self.verify_single_class()
+    
+    def verify_single_class(self, num_check=100):
+        """Verify that all sets contain images from only one class."""
+        print(f"\n{'='*70}")
+        print(f"Verifying single-class constraint for {self.split} split...")
+        print(f"{'='*70}")
+        
+        issues = []
+        num_check = min(num_check, len(self.data['targets']))
+        
+        for i in range(num_check):
+            labels = self.data['targets'][i]
+            unique_labels = np.unique(labels)
+            if len(unique_labels) > 1:
+                issues.append({
+                    'set_idx': i,
+                    'labels': labels.tolist(),
+                    'unique': unique_labels.tolist()
+                })
+        
+        if issues:
+            print(f"❌ ERROR: Found {len(issues)} sets with MIXED CLASSES!")
+            print(f"\nFirst 5 problematic sets:")
+            for issue in issues[:5]:
+                class_names = [self.map_cls.get(lbl, f"class_{lbl}") for lbl in issue['labels']]
+                print(f"  Set {issue['set_idx']}: labels={issue['labels']}")
+                print(f"    Class names: {class_names}")
+            raise ValueError(f"Dataset contains {len(issues)} mixed-class sets! Check make_sets() logic.")
+        else:
+            # Check all (not just num_check)
+            all_single = True
+            for i in range(len(self.data['targets'])):
+                if len(np.unique(self.data['targets'][i])) > 1:
+                    all_single = False
+                    break
+            
+            if all_single:
+                print(f"✅ All {len(self.data['targets'])} sets are single-class")
+                # Show example
+                sample_labels = self.data['targets'][0]
+                sample_class = sample_labels[0]
+                sample_class_name = self.map_cls.get(sample_class, f"class_{sample_class}")
+                print(f"   Example: Set 0 has {len(sample_labels)} images, all from class '{sample_class_name}' (ID: {sample_class})")
+            else:
+                print(f"⚠️  WARNING: Some sets outside checked range may have mixed classes")
+        
+        print(f"{'='*70}\n")
 
     def get_data(self):
         img = []

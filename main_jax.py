@@ -14,6 +14,7 @@ import orbax.checkpoint as ocp
 import os
 import wandb
 from tqdm import tqdm
+import traceback
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server use
 import matplotlib.pyplot as plt
@@ -54,9 +55,12 @@ def visualize_support_target_split(batch_set, max_sets=2, max_images_per_set=6):
     Returns:
         List of matplotlib figures for wandb logging
     """
-    import matplotlib.pyplot as plt
     
-    bs, ns = batch_set.shape[:2]
+    # Validate and fix batch shape
+    if len(batch_set.shape) != 5:
+        raise ValueError(f"Expected batch_set shape (bs, ns, C, H, W), got {batch_set.shape}")
+    
+    bs, ns, C, H, W = batch_set.shape
     max_sets = min(max_sets, bs)
     ns_show = min(max_images_per_set, ns)
     
@@ -70,8 +74,13 @@ def visualize_support_target_split(batch_set, max_sets=2, max_images_per_set=6):
         fig, axes = plt.subplots(ns_show, ns_show + 1, 
                                 figsize=(ns_show * 1.2 + 1, ns_show * 1.2))
         
+        # Handle axes indexing for different subplot configurations
         if ns_show == 1:
+            # Single row: axes is 1D array of shape (ns_show + 1,)
             axes = axes.reshape(1, -1)
+        elif ns_show > 1:
+            # Multiple rows: axes is already 2D array of shape (ns_show, ns_show + 1)
+            pass
         
         for i in range(ns_show):
             # Target image
@@ -80,31 +89,35 @@ def visualize_support_target_split(batch_set, max_sets=2, max_images_per_set=6):
             target_img = np.clip(target_img.transpose(1, 2, 0), 0, 1)
             
             # Row label
-            axes[i, 0].text(0.5, 0.5, f'T={i}', 
-                           ha='center', va='center', fontsize=10, weight='bold')
-            axes[i, 0].axis('off')
+            ax_label = axes[i, 0] if ns_show > 1 or isinstance(axes, np.ndarray) else axes[0]
+            ax_label.text(0.5, 0.5, f'T={i}', 
+                         ha='center', va='center', fontsize=10, weight='bold')
+            ax_label.axis('off')
             
             # Show target with red border
-            axes[i, 1].imshow(target_img)
-            axes[i, 1].set_title('TARGET', fontsize=7, color='red', weight='bold')
-            axes[i, 1].axis('off')
-            for spine in axes[i, 1].spines.values():
+            ax_target = axes[i, 1]
+            ax_target.imshow(target_img)
+            ax_target.set_title('TARGET', fontsize=7, color='red', weight='bold')
+            ax_target.axis('off')
+            for spine in ax_target.spines.values():
                 spine.set_edgecolor('red')
                 spine.set_linewidth(2)
             
             # Support set (leave-one-out: all except i)
             support_indices = [k for k in range(ns_show) if k != i]
             for j, support_idx in enumerate(support_indices):
-                if j + 2 < ns_show + 1:
+                col_idx = j + 2
+                if col_idx < ns_show + 1:
                     support_img = one_set[support_idx]
                     support_img = (support_img + 1) / 2
                     support_img = np.clip(support_img.transpose(1, 2, 0), 0, 1)
                     
-                    axes[i, j + 2].imshow(support_img)
+                    ax_support = axes[i, col_idx]
+                    ax_support.imshow(support_img)
                     if i == 0:
-                        axes[i, j + 2].set_title(f'S{j}', fontsize=7, color='blue')
-                    axes[i, j + 2].axis('off')
-                    for spine in axes[i, j + 2].spines.values():
+                        ax_support.set_title(f'S{j}', fontsize=7, color='blue')
+                    ax_support.axis('off')
+                    for spine in ax_support.spines.values():
                         spine.set_edgecolor('blue')
                         spine.set_linewidth(1)
         
@@ -472,13 +485,21 @@ def main():
                     if args.log_support_target:
                         try:
                             # Get unsharded batch for visualization (first device)
-                            batch_vis = batch_sharded[0] if isinstance(batch_sharded, (list, tuple)) else batch_sharded
+                            # batch_sharded can be: (n_devices, bs_per_device, ns, C, H, W)
+                            batch_vis = batch_sharded[0] if isinstance(batch_sharded, (list, tuple)) or len(batch_sharded.shape) == 6 else batch_sharded
+                            
+                            # Log batch shape for debugging
+                            logger.log(f"Batch shape for visualization: {batch_vis.shape}")
+                            
+                            # Validate shape
+                            if len(batch_vis.shape) != 5:
+                                raise ValueError(f"Expected (bs, ns, C, H, W), got shape {batch_vis.shape}")
                             
                             # Create visualization figures
                             figs = visualize_support_target_split(
                                 batch_vis, 
-                                max_sets=args.vis_num_sets, 
-                                max_images_per_set=6
+                                max_sets=min(args.vis_num_sets, batch_vis.shape[0]), 
+                                max_images_per_set=min(6, batch_vis.shape[1])
                             )
                             
                             # Log figures to wandb
@@ -511,7 +532,9 @@ def main():
                             log_dict["train/support_examples"] = support_images
                             
                         except Exception as e:
+                            import traceback
                             logger.log(f"Warning: Could not visualize support/target: {e}")
+                            logger.log(f"Traceback: {traceback.format_exc()}")
                     
                     wandb.log(log_dict, step=global_step)
 
