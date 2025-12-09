@@ -14,6 +14,9 @@ import orbax.checkpoint as ocp
 import os
 import wandb
 from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for server use
+import matplotlib.pyplot as plt
 
 from dataset import create_loader
 from model import select_model  # keeps existing namespace for non-JAX
@@ -37,6 +40,80 @@ from utils.util import set_seed
 
 
 DIR = set_folder()
+
+
+def visualize_support_target_split(batch_set, max_sets=2, max_images_per_set=6):
+    """
+    Visualize leave-one-out support/target splits from training batch.
+    
+    Args:
+        batch_set: (bs, ns, C, H, W) in [-1, 1] range
+        max_sets: Number of sets to visualize
+        max_images_per_set: Max images per set to show
+    
+    Returns:
+        List of matplotlib figures for wandb logging
+    """
+    import matplotlib.pyplot as plt
+    
+    bs, ns = batch_set.shape[:2]
+    max_sets = min(max_sets, bs)
+    ns_show = min(max_images_per_set, ns)
+    
+    figures = []
+    
+    for set_idx in range(max_sets):
+        one_set = batch_set[set_idx]  # (ns, C, H, W)
+        
+        # Create figure: ns_show rows, ns_show + 1 columns
+        # Column 0: label, Column 1: target (red border), Columns 2+: support (blue borders)
+        fig, axes = plt.subplots(ns_show, ns_show + 1, 
+                                figsize=(ns_show * 1.2 + 1, ns_show * 1.2))
+        
+        if ns_show == 1:
+            axes = axes.reshape(1, -1)
+        
+        for i in range(ns_show):
+            # Target image
+            target_img = one_set[i]  # (C, H, W)
+            target_img = (target_img + 1) / 2  # [-1,1] → [0,1]
+            target_img = np.clip(target_img.transpose(1, 2, 0), 0, 1)
+            
+            # Row label
+            axes[i, 0].text(0.5, 0.5, f'T={i}', 
+                           ha='center', va='center', fontsize=10, weight='bold')
+            axes[i, 0].axis('off')
+            
+            # Show target with red border
+            axes[i, 1].imshow(target_img)
+            axes[i, 1].set_title('TARGET', fontsize=7, color='red', weight='bold')
+            axes[i, 1].axis('off')
+            for spine in axes[i, 1].spines.values():
+                spine.set_edgecolor('red')
+                spine.set_linewidth(2)
+            
+            # Support set (leave-one-out: all except i)
+            support_indices = [k for k in range(ns_show) if k != i]
+            for j, support_idx in enumerate(support_indices):
+                if j + 2 < ns_show + 1:
+                    support_img = one_set[support_idx]
+                    support_img = (support_img + 1) / 2
+                    support_img = np.clip(support_img.transpose(1, 2, 0), 0, 1)
+                    
+                    axes[i, j + 2].imshow(support_img)
+                    if i == 0:
+                        axes[i, j + 2].set_title(f'S{j}', fontsize=7, color='blue')
+                    axes[i, j + 2].axis('off')
+                    for spine in axes[i, j + 2].spines.values():
+                        spine.set_edgecolor('blue')
+                        spine.set_linewidth(1)
+        
+        plt.suptitle(f'Set {set_idx}: Leave-One-Out (Target=Red, Support=Blue)', 
+                     fontsize=10, weight='bold')
+        plt.tight_layout()
+        figures.append(fig)
+    
+    return figures
 
 
 def numpy_from_torch(batch):
@@ -386,8 +463,57 @@ def main():
                         v = v.item() if v.size == 1 else v
                     logger.logkv_mean(k, v)
                 logger.dumpkvs(global_step)
+                
+                # Log to wandb with support/target visualization
                 if args.use_wandb:
-                    wandb.log(metrics_host, step=global_step)
+                    log_dict = dict(metrics_host)
+                    
+                    # Visualize support/target split for training batch
+                    if args.log_support_target:
+                        try:
+                            # Get unsharded batch for visualization (first device)
+                            batch_vis = batch_sharded[0] if isinstance(batch_sharded, (list, tuple)) else batch_sharded
+                            
+                            # Create visualization figures
+                            figs = visualize_support_target_split(
+                                batch_vis, 
+                                max_sets=args.vis_num_sets, 
+                                max_images_per_set=6
+                            )
+                            
+                            # Log figures to wandb
+                            for idx, fig in enumerate(figs):
+                                log_dict[f"train/support_target_set_{idx}"] = wandb.Image(fig)
+                                plt.close(fig)  # Close to free memory
+                            
+                            # Also log individual support and target images
+                            one_set = batch_vis[0]  # First set
+                            ns = one_set.shape[0]
+                            
+                            # Log first target image and its support set
+                            target_idx = 0
+                            support_indices = [k for k in range(ns) if k != target_idx][:5]  # Max 5 support images
+                            
+                            # Target image
+                            target_img = one_set[target_idx]
+                            target_img = (target_img + 1) / 2
+                            target_img = np.clip(target_img.transpose(1, 2, 0), 0, 1)
+                            log_dict["train/target_example"] = wandb.Image(target_img, caption="Target Image")
+                            
+                            # Support images
+                            support_images = []
+                            for sup_idx in support_indices:
+                                sup_img = one_set[sup_idx]
+                                sup_img = (sup_img + 1) / 2
+                                sup_img = np.clip(sup_img.transpose(1, 2, 0), 0, 1)
+                                support_images.append(wandb.Image(sup_img, caption=f"Support {sup_idx}"))
+                            
+                            log_dict["train/support_examples"] = support_images
+                            
+                        except Exception as e:
+                            logger.log(f"Warning: Could not visualize support/target: {e}")
+                    
+                    wandb.log(log_dict, step=global_step)
 
             # Save / Eval / Sample
             if args.save_interval and global_step % args.save_interval == 0:
@@ -502,6 +628,10 @@ def create_argparser():
         compute_fid=False,
         # Reduced from 4096 for faster eval (still reliable)
         fid_num_samples=1024,
+        # Log support/target visualization at each log_interval
+        log_support_target=True,
+        # Number of sets to visualize per log
+        vis_num_sets=2,
     )
     defaults.update(model_and_diffusion_defaults_jax())
     parser = argparse.ArgumentParser()
