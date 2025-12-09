@@ -44,15 +44,18 @@ def main():
     print("computing reference batch activations...")
     ref_acts = evaluator.read_activations(args.ref_batch, "reference")
     print("computing/reading reference batch statistics...")
-    ref_stats, ref_stats_spatial = evaluator.read_statistics(args.ref_batch, ref_acts)
+    ref_stats, ref_stats_spatial = evaluator.read_statistics(
+        args.ref_batch, ref_acts)
 
     print("computing sample batch activations...")
     sample_acts = evaluator.read_activations(args.sample_batch, "sample")
     print("computing/reading sample batch statistics...")
-    sample_stats, sample_stats_spatial = evaluator.read_statistics(args.sample_batch, sample_acts)
+    sample_stats, sample_stats_spatial = evaluator.read_statistics(
+        args.sample_batch, sample_acts)
 
     print("Computing evaluations...")
-    print("Inception Score:", evaluator.compute_inception_score(sample_acts[0]))
+    print("Inception Score:",
+          evaluator.compute_inception_score(sample_acts[0]))
     print("FID:", sample_stats.frechet_distance(ref_stats))
     print("sFID:", sample_stats_spatial.frechet_distance(ref_stats_spatial))
     prec, recall = evaluator.compute_prec_recall(ref_acts[0], sample_acts[0])
@@ -127,9 +130,11 @@ class Evaluator:
         self.softmax_batch_size = softmax_batch_size
         self.manifold_estimator = ManifoldEstimator(session)
         with self.sess.graph.as_default():
-            self.image_input = tf.placeholder(tf.float32, shape=[None, None, None, 3])
+            self.image_input = tf.placeholder(
+                tf.float32, shape=[None, None, None, 3])
             self.softmax_input = tf.placeholder(tf.float32, shape=[None, 2048])
-            self.pool_features, self.spatial_features = _create_feature_graph(self.image_input)
+            self.pool_features, self.spatial_features = _create_feature_graph(
+                self.image_input)
             self.softmax = _create_softmax_graph(self.softmax_input)
 
     def warmup(self):
@@ -138,13 +143,13 @@ class Evaluator:
     def read_activations(self, npz_path: str, mode: str) -> Tuple[np.ndarray, np.ndarray]:
         # for reference batch arr="arr_0", for samples arr="arr_1"
         if mode == "reference":
-            arr = "arr_1" # conditioning set
+            arr = "arr_1"  # conditioning set
         else:
-            arr = "arr_0" # samples
+            arr = "arr_0"  # samples
         with open_npz_array(npz_path, arr) as reader:
             return self.compute_activations(reader.read_batches(self.batch_size), mode)
 
-    def compute_activations(self, batches: Iterable[np.ndarray], mode: str="") -> Tuple[np.ndarray, np.ndarray]:
+    def compute_activations(self, batches: Iterable[np.ndarray], mode: str = "") -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute image features for downstream evals.
 
@@ -161,18 +166,20 @@ class Evaluator:
             #     # [0, 1] ---> [0, 255]
             #     batch = (batch * 255.0)
             # elif mode == "sample":
-            #     # [122.5, 255] ---> [0, 1] --->  
+            #     # [122.5, 255] ---> [0, 1] --->
             #     batch = (batch - 122.5) / 122.5
             #     batch = (batch * 255.0)
 
-            #print(batch.min(), batch.max())
+            # print(batch.min(), batch.max())
 
             # print(batch.max(), batch.min())
             pred, spatial_pred = self.sess.run(
-                [self.pool_features, self.spatial_features], {self.image_input: batch}
+                [self.pool_features, self.spatial_features], {
+                    self.image_input: batch}
             )
             preds.append(pred.reshape([pred.shape[0], -1]))
-            spatial_preds.append(spatial_pred.reshape([spatial_pred.shape[0], -1]))
+            spatial_preds.append(spatial_pred.reshape(
+                [spatial_pred.shape[0], -1]))
         return (
             np.concatenate(preds, axis=0),
             np.concatenate(spatial_preds, axis=0),
@@ -196,14 +203,16 @@ class Evaluator:
     def compute_inception_score(self, activations: np.ndarray, split_size: int = 5000) -> float:
         softmax_out = []
         for i in range(0, len(activations), self.softmax_batch_size):
-            acts = activations[i : i + self.softmax_batch_size]
-            softmax_out.append(self.sess.run(self.softmax, feed_dict={self.softmax_input: acts}))
+            acts = activations[i: i + self.softmax_batch_size]
+            softmax_out.append(self.sess.run(
+                self.softmax, feed_dict={self.softmax_input: acts}))
         preds = np.concatenate(softmax_out, axis=0)
         # https://github.com/openai/improved-gan/blob/4f5d1ec5c16a7eceb206f42bfc652693601e1d5c/inception_score/model.py#L46
         scores = []
         for i in range(0, len(preds), split_size):
-            part = preds[i : i + split_size]
-            kl = part * (np.log(part) - np.log(np.expand_dims(np.mean(part, 0), 0)))
+            part = preds[i: i + split_size]
+            kl = part * (np.log(part) -
+                         np.log(np.expand_dims(np.mean(part, 0), 0)))
             kl = np.mean(np.sum(kl, 1))
             scores.append(np.exp(kl))
         return float(np.mean(scores))
@@ -267,7 +276,8 @@ class ManifoldEstimator:
 
         # Estimate manifold of features by calculating distances to k-NN of each sample.
         radii = np.zeros([num_images, self.num_nhoods], dtype=np.float32)
-        distance_batch = np.zeros([self.row_batch_size, num_images], dtype=np.float32)
+        distance_batch = np.zeros(
+            [self.row_batch_size, num_images], dtype=np.float32)
         seq = np.arange(max(self.nhood_sizes) + 1, dtype=np.int32)
 
         for begin1 in range(0, num_images, self.row_batch_size):
@@ -280,20 +290,21 @@ class ManifoldEstimator:
 
                 # Compute distances between batches.
                 distance_batch[
-                    0 : end1 - begin1, begin2:end2
+                    0: end1 - begin1, begin2:end2
                 ] = self.distance_block.pairwise_distances(row_batch, col_batch)
 
             # Find the k-nearest neighbor from the current batch.
             radii[begin1:end1, :] = np.concatenate(
                 [
                     x[:, self.nhood_sizes]
-                    for x in _numpy_partition(distance_batch[0 : end1 - begin1, :], seq, axis=1)
+                    for x in _numpy_partition(distance_batch[0: end1 - begin1, :], seq, axis=1)
                 ],
                 axis=0,
             )
 
         if self.clamp_to_percentile is not None:
-            max_distances = np.percentile(radii, self.clamp_to_percentile, axis=0)
+            max_distances = np.percentile(
+                radii, self.clamp_to_percentile, axis=0)
             radii[radii > max_distances] = 0
         return radii
 
@@ -303,8 +314,10 @@ class ManifoldEstimator:
         """
         num_eval_images = eval_features.shape[0]
         num_ref_images = radii.shape[0]
-        distance_batch = np.zeros([self.row_batch_size, num_ref_images], dtype=np.float32)
-        batch_predictions = np.zeros([num_eval_images, self.num_nhoods], dtype=np.int32)
+        distance_batch = np.zeros(
+            [self.row_batch_size, num_ref_images], dtype=np.float32)
+        batch_predictions = np.zeros(
+            [num_eval_images, self.num_nhoods], dtype=np.int32)
         max_realism_score = np.zeros([num_eval_images], dtype=np.float32)
         nearest_indices = np.zeros([num_eval_images], dtype=np.int32)
 
@@ -317,20 +330,23 @@ class ManifoldEstimator:
                 ref_batch = features[begin2:end2]
 
                 distance_batch[
-                    0 : end1 - begin1, begin2:end2
+                    0: end1 - begin1, begin2:end2
                 ] = self.distance_block.pairwise_distances(feature_batch, ref_batch)
 
             # From the minibatch of new feature vectors, determine if they are in the estimated manifold.
             # If a feature vector is inside a hypersphere of some reference sample, then
             # the new sample lies at the estimated manifold.
             # The radii of the hyperspheres are determined from distances of neighborhood size k.
-            samples_in_manifold = distance_batch[0 : end1 - begin1, :, None] <= radii
-            batch_predictions[begin1:end1] = np.any(samples_in_manifold, axis=1).astype(np.int32)
+            samples_in_manifold = distance_batch[0: end1 -
+                                                 begin1, :, None] <= radii
+            batch_predictions[begin1:end1] = np.any(
+                samples_in_manifold, axis=1).astype(np.int32)
 
             max_realism_score[begin1:end1] = np.max(
-                radii[:, 0] / (distance_batch[0 : end1 - begin1, :] + self.eps), axis=1
+                radii[:, 0] / (distance_batch[0: end1 - begin1, :] + self.eps), axis=1
             )
-            nearest_indices[begin1:end1] = np.argmin(distance_batch[0 : end1 - begin1, :], axis=1)
+            nearest_indices[begin1:end1] = np.argmin(
+                distance_batch[0: end1 - begin1, :], axis=1)
 
         return {
             "fraction": float(np.mean(batch_predictions)),
@@ -357,8 +373,10 @@ class ManifoldEstimator:
                  - precision: an np.ndarray of length K1
                  - recall: an np.ndarray of length K2
         """
-        features_1_status = np.zeros([len(features_1), radii_2.shape[1]], dtype=np.bool)
-        features_2_status = np.zeros([len(features_2), radii_1.shape[1]], dtype=np.bool)
+        features_1_status = np.zeros(
+            [len(features_1), radii_2.shape[1]], dtype=np.bool)
+        features_2_status = np.zeros(
+            [len(features_2), radii_1.shape[1]], dtype=np.bool)
         for begin_1 in range(0, len(features_1), self.row_batch_size):
             end_1 = begin_1 + self.row_batch_size
             batch_1 = features_1[begin_1:end_1]
@@ -388,8 +406,10 @@ class DistanceBlock:
 
         # Initialize TF graph to calculate pairwise distances.
         with session.graph.as_default():
-            self._features_batch1 = tf.placeholder(tf.float32, shape=[None, None])
-            self._features_batch2 = tf.placeholder(tf.float32, shape=[None, None])
+            self._features_batch1 = tf.placeholder(
+                tf.float32, shape=[None, None])
+            self._features_batch2 = tf.placeholder(
+                tf.float32, shape=[None, None])
             distance_block_16 = _batch_pairwise_distances(
                 tf.cast(self._features_batch1, tf.float16),
                 tf.cast(self._features_batch2, tf.float16),
@@ -397,15 +417,18 @@ class DistanceBlock:
             self.distance_block = tf.cond(
                 tf.reduce_all(tf.math.is_finite(distance_block_16)),
                 lambda: tf.cast(distance_block_16, tf.float32),
-                lambda: _batch_pairwise_distances(self._features_batch1, self._features_batch2),
+                lambda: _batch_pairwise_distances(
+                    self._features_batch1, self._features_batch2),
             )
 
             # Extra logic for less thans.
             self._radii1 = tf.placeholder(tf.float32, shape=[None, None])
             self._radii2 = tf.placeholder(tf.float32, shape=[None, None])
             dist32 = tf.cast(self.distance_block, tf.float32)[..., None]
-            self._batch_1_in = tf.math.reduce_any(dist32 <= self._radii2, axis=1)
-            self._batch_2_in = tf.math.reduce_any(dist32 <= self._radii1[:, None], axis=0)
+            self._batch_1_in = tf.math.reduce_any(
+                dist32 <= self._radii2, axis=1)
+            self._batch_2_in = tf.math.reduce_any(
+                dist32 <= self._radii1[:, None], axis=0)
 
     def pairwise_distances(self, U, V):
         """
@@ -522,7 +545,7 @@ class MemoryNpzArrayReader(NpzArrayReader):
         if self.idx >= self.arr.shape[0]:
             return None
 
-        res = self.arr[self.idx : self.idx + batch_size]
+        res = self.arr[self.idx: self.idx + batch_size]
         self.idx += batch_size
         return res
 
@@ -659,7 +682,7 @@ def _numpy_partition(arr, kth, **kwargs):
     batches = []
     for i in range(num_workers):
         size = chunk_size + (1 if i < extra else 0)
-        batches.append(arr[start_idx : start_idx + size])
+        batches.append(arr[start_idx: start_idx + size])
         start_idx += size
 
     with ThreadPool(num_workers) as pool:

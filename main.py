@@ -9,14 +9,15 @@ from model import select_model
 from model.set_diffusion import logger
 from model.set_diffusion.resample import create_named_schedule_sampler
 from model.set_diffusion.script_util import (add_dict_to_argparser,
-                                                args_to_dict,
-                                                create_model_and_diffusion,
-                                                model_and_diffusion_defaults)
+                                             args_to_dict,
+                                             create_model_and_diffusion,
+                                             model_and_diffusion_defaults)
 from model.set_diffusion.train_util import TrainLoop
 from utils.util import count_params, set_seed
 from utils.path import set_folder
 
-DIR=set_folder()
+DIR = set_folder()
+
 
 def main():
     args = create_argparser().parse_args()
@@ -24,8 +25,8 @@ def main():
     dct = vars(args)
     for k in sorted(dct):
         print(k, dct[k])
-    print()    
-    
+    print()
+
     # dist_util.setup_dist()
     logger.configure(dir=DIR, mode="training", args=args, tag='')
 
@@ -76,10 +77,11 @@ def create_argparser():
         hdim=256,
         in_channels=3,
         encoder_mode='vit',
-        pool='mean', # mean, mean_patch
+        pool='mean',  # mean, mean_patch
         context_channels=256,
         mode_context="deterministic",
-        mode_conditioning='film', # conditions using film, lag conditions using attention, None standard DDPM, film+lag
+        # conditions using film, lag conditions using attention, None standard DDPM, film+lag
+        mode_conditioning='film',
         augment=False,
         device="cuda",
         data_dir="/home/gigi/ns_data",

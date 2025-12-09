@@ -323,10 +323,10 @@ class DiT(nn.Module):
                 conditioning = t_emb + context_proj
             else:
                 # MUST call layer with dummy input to initialize parameters
-                # Otherwise parameters won't exist when c!=None during training
+                # AND add the zero projection to maintain consistent computation graph
                 dummy_c = jnp.zeros((x.shape[0], self.context_channels), dtype=x.dtype)
-                _ = context_proj_layer(dummy_c)
-                conditioning = t_emb
+                zero_context_proj = context_proj_layer(dummy_c)
+                conditioning = t_emb + zero_context_proj  # FIX: consistent with c!=None case
         else:
             conditioning = t_emb
 
@@ -732,10 +732,10 @@ class DiT(nn.Module):
                 conditioning = t_emb + context_proj  # (B, hidden_size)
             else:
                 # MUST call layer with dummy input to initialize parameters
-                # Otherwise parameters won't exist when c!=None during training
+                # AND add the zero projection to maintain consistent computation graph
                 dummy_c = jnp.zeros((x.shape[0], self.context_channels), dtype=x.dtype)
-                _ = context_proj_layer(dummy_c)
-                conditioning = t_emb
+                zero_context_proj = context_proj_layer(dummy_c)
+                conditioning = t_emb + zero_context_proj  # FIX: consistent with c!=None case
         else:
             # Lag mode: giữ time embedding riêng, context sẽ dùng cho cross-attention
             conditioning = t_emb

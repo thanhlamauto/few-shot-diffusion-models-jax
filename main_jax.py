@@ -176,7 +176,8 @@ def compute_fid_4096(p_state, modules, cfg, val_loader, n_samples, rng, use_ddim
 
         # Generate MULTIPLE samples from the SAME support set (BATCHED)
         # Instead of 20 calls with 6 samples each, make 1 call with 120 samples
-        n_repeats = min(samples_per_support_set, (n_samples - total_generated + bs*ns - 1) // (bs*ns))
+        n_repeats = min(samples_per_support_set, (n_samples -
+                        total_generated + bs*ns - 1) // (bs*ns))
         if n_repeats == 0:
             break
 
@@ -204,7 +205,8 @@ def compute_fid_4096(p_state, modules, cfg, val_loader, n_samples, rng, use_ddim
 
         # Replicate real images to match: (6, C, H, W) -> (120, C, H, W)
         real_np = batch_np.reshape(-1, C, H, W)  # (6, C, H, W)
-        real_replicated = np.tile(real_np, (n_repeats, 1, 1, 1))  # (120, C, H, W)
+        real_replicated = np.tile(
+            real_np, (n_repeats, 1, 1, 1))  # (120, C, H, W)
         real_hwc = real_replicated.transpose(0, 2, 3, 1)  # NCHW -> NHWC
 
         all_generated.append(samples_hwc)
