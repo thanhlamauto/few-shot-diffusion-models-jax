@@ -632,7 +632,7 @@ def create_argparser():
         log_support_target=True,
         # Number of sets to visualize per log
         vis_num_sets=2,
-    )
+    ) 
     defaults.update(model_and_diffusion_defaults_jax())
     parser = argparse.ArgumentParser()
     add_dict_to_argparser_jax(parser, defaults)
