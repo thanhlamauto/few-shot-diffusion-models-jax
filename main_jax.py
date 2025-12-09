@@ -569,18 +569,48 @@ def main():
 
                         log_dict["samples"] = sample_images
 
-                        # Log support set images
-                        support_images = []
-                        # Flatten (B, ns, C, H, W) -> (B*ns, C, H, W)
-                        support_flat = support.reshape(-1, *support.shape[2:])
-                        for idx in range(min(8, support_flat.shape[0])):
-                            img = support_flat[idx].transpose(
-                                1, 2, 0)  # CHW -> HWC
-                            img = np.clip((img + 1) / 2, 0, 1)
-                            support_images.append(wandb.Image(
-                                img, caption=f"Support {idx}"))
-
-                        log_dict["support_set"] = support_images
+                        # Log support set images - show MULTIPLE sets to verify single-class
+                        # Each set should contain images from ONLY ONE class
+                        num_sets_to_show = min(3, support.shape[0])  # Show 3 sets
+                        
+                        for set_idx in range(num_sets_to_show):
+                            support_images = []
+                            one_set = support[set_idx]  # (ns, C, H, W)
+                            num_images_in_set = min(6, one_set.shape[0])
+                            
+                            for img_idx in range(num_images_in_set):
+                                img = one_set[img_idx].transpose(1, 2, 0)  # CHW -> HWC
+                                img = np.clip((img + 1) / 2, 0, 1)
+                                support_images.append(wandb.Image(
+                                    img, caption=f"Img {img_idx}"))
+                            
+                            log_dict[f"support_set/set_{set_idx}"] = support_images
+                        
+                        # Also create a grid visualization showing all sets together
+                        try:
+                            fig, axes = plt.subplots(num_sets_to_show, min(6, support.shape[1]), 
+                                                    figsize=(12, num_sets_to_show * 2))
+                            if num_sets_to_show == 1:
+                                axes = axes.reshape(1, -1)
+                            
+                            for set_idx in range(num_sets_to_show):
+                                one_set = support[set_idx]
+                                for img_idx in range(min(6, one_set.shape[0])):
+                                    img = one_set[img_idx].transpose(1, 2, 0)
+                                    img = np.clip((img + 1) / 2, 0, 1)
+                                    axes[set_idx, img_idx].imshow(img)
+                                    axes[set_idx, img_idx].axis('off')
+                                    if img_idx == 0:
+                                        axes[set_idx, img_idx].set_ylabel(
+                                            f'Set {set_idx}', rotation=0, ha='right', va='center', fontsize=10)
+                            
+                            plt.suptitle('Support Sets (Each row = 1 set, should be same class)', 
+                                        fontsize=12, weight='bold')
+                            plt.tight_layout()
+                            log_dict["support_set/grid"] = wandb.Image(fig)
+                            plt.close(fig)
+                        except Exception as e:
+                            logger.log(f"Could not create support grid: {e}")
 
                 # Compute FID if enabled
                 if args.compute_fid and inception_fn is not None:
@@ -633,7 +663,7 @@ def create_argparser():
         lr_anneal_steps=0,
         max_steps=0,  # 0 means infinite, set to positive number to limit training
         batch_size=16,
-        batch_size_eval=1,
+        batch_size_eval=16,
         log_interval=100,
         save_interval=10000,
         num_eval_batches=10,
