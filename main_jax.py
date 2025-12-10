@@ -301,7 +301,7 @@ def compute_fid_per_class(p_state, modules, cfg, val_dataset, n_samples, rng, us
     print(f"✅ Created {n_sets} sets, shape: {batch_sets.shape}")
     
     # Step 4: Generate samples in batches
-    print(f"\n🎨 Generating {total_to_generate} samples (6 per set via leave-one-out)...")
+    print(f"\n🎨 Generating {total_to_generate} samples ({ns} per set via leave-one-out)...")
     all_generated = []
     batch_size = 16  # Process 16 sets at a time to avoid OOM
     
@@ -309,6 +309,19 @@ def compute_fid_per_class(p_state, modules, cfg, val_dataset, n_samples, rng, us
     ema_params = flax.jax_utils.unreplicate(p_state.ema_params)
     
     C, H, W = batch_sets.shape[2], batch_sets.shape[3], batch_sets.shape[4]
+    
+    # CRITICAL FIX: Ensure cfg.sample_size matches actual data
+    # batch_sets has 6 images per set, but cfg might have sample_size=5 (default)
+    actual_ns = batch_sets.shape[1]  # Should be 6
+    if cfg.sample_size != actual_ns:
+        print(f"⚠️  Config mismatch detected: cfg.sample_size={cfg.sample_size}, but data has {actual_ns} images/set")
+        print(f"   Creating temporary config with sample_size={actual_ns} for FID generation...")
+        
+        # Create a new config with corrected sample_size
+        import dataclasses
+        cfg_fid = dataclasses.replace(cfg, sample_size=actual_ns)
+    else:
+        cfg_fid = cfg
     
     pbar = tqdm(total=n_sets, desc="Generating samples", unit="sets")
     
@@ -318,18 +331,18 @@ def compute_fid_per_class(p_state, modules, cfg, val_dataset, n_samples, rng, us
         
         bs = len(mini_batch)
         
-        # Get conditioning via leave-one-out (creates bs*6 conditionings)
+        # Get conditioning via leave-one-out (creates bs*actual_ns conditionings)
         sub = {"encoder": ema_params["encoder"],
                "posterior": ema_params.get("posterior")}
         rng, cond_rng = jax.random.split(rng)
         c_cond, _ = leave_one_out_c(
-            cond_rng, sub, modules, mini_batch, cfg, train=False)
+            cond_rng, sub, modules, mini_batch, cfg_fid, train=False)
         
-        # c_cond shape: (bs * 6, hdim) - one conditioning per image
-        # Generate bs*6 samples (6 per set)
+        # c_cond shape: (bs * actual_ns, hdim) - one conditioning per image
+        # Generate bs*actual_ns samples (actual_ns per set)
         diffusion = modules["diffusion"]
         model_apply = modules["dit"].apply
-        shape = (bs * ns, C, H, W)  # bs*6 samples
+        shape = (bs * actual_ns, C, H, W)  # bs*actual_ns samples
         
         rng, sample_rng = jax.random.split(rng)
         samples = sample_ema(
@@ -343,7 +356,7 @@ def compute_fid_per_class(p_state, modules, cfg, val_dataset, n_samples, rng, us
     pbar.close()
     
     # Concatenate all generated samples
-    generated_images = np.concatenate(all_generated, axis=0)  # (n_sets*6, C, H, W)
+    generated_images = np.concatenate(all_generated, axis=0)  # (n_sets*actual_ns, C, H, W)
     generated_images = generated_images[:n_samples]  # Take first n_samples
     
     # Step 5: Prepare real images (all from the selected class)
@@ -377,16 +390,16 @@ def compute_fid_per_class(p_state, modules, cfg, val_dataset, n_samples, rng, us
         print(f"{'='*70}\n")
         
         # Prepare class info for logging (include sample data for visualization)
-        # Safely get visualization data (handle case with < 18 images)
-        num_viz_samples = min(18, len(generated_images), len(real_images))
-        num_viz_sets = num_viz_samples // 6  # How many complete sets of 6 we can visualize
+        # Safely get visualization data (handle case with < actual_ns*3 images)
+        num_viz_samples = min(actual_ns * 3, len(generated_images), len(real_images))
+        num_viz_sets = num_viz_samples // actual_ns  # How many complete sets we can visualize
         
         viz_data = {}
         if num_viz_sets > 0:
             viz_data = {
-                'viz_support_sets': batch_sets[:num_viz_sets],  # (num_viz_sets, 6, C, H, W)
-                'viz_generated': generated_images[:num_viz_sets*6].reshape(num_viz_sets, 6, C, H, W),
-                'viz_real': real_images[:num_viz_sets*6].reshape(num_viz_sets, 6, C, H, W),
+                'viz_support_sets': batch_sets[:num_viz_sets],  # (num_viz_sets, actual_ns, C, H, W)
+                'viz_generated': generated_images[:num_viz_sets*actual_ns].reshape(num_viz_sets, actual_ns, C, H, W),
+                'viz_real': real_images[:num_viz_sets*actual_ns].reshape(num_viz_sets, actual_ns, C, H, W),
             }
         
         class_info = {
@@ -971,7 +984,7 @@ def create_argparser():
         model="vfsddpm_jax",
         dataset="cifar100",
         image_size=32,
-        sample_size=5,
+        sample_size=6,  # Changed from 5 to 6 to match typical usage
         patch_size=8,
         hdim=448,  # Must be divisible by 4 for positional embeddings (depth=6, ~43M params)
         in_channels=3,
