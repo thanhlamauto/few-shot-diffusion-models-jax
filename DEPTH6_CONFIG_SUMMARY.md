@@ -25,7 +25,7 @@ python main_jax.py \
     --num_heads 9 \          # ← Changed from 6 to 9
     --mlp_ratio 3.0 \
     --compute_fid True\
-    --fid_num_samples 600
+    --fid_num_samples 1024
 ```
 
 **Note:** `hdim` and `context_channels` are automatically set to 450 in defaults.

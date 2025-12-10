@@ -91,11 +91,45 @@ def get_fid_fn():
     Returns:
         apply_fn: Function that takes images in [-1, 1] and returns 2048-d features
     """
+    print("\n" + "="*70)
+    print("Loading InceptionV3 for FID computation...")
+    print("="*70)
+    
+    # Create progress bar for 3 main steps
+    pbar = tqdm(total=3, desc="InceptionV3 Setup", unit="step")
+    
+    # Step 1: Load pretrained model
+    pbar.set_description("📥 Loading pretrained weights")
+    start_time = time.time()
     model = InceptionV3(pretrained=True)
+    elapsed = time.time() - start_time
+    pbar.update(1)
+    pbar.set_postfix({"time": f"{elapsed:.1f}s"})
+    
+    # Step 2: Initialize parameters
+    pbar.set_description("🔧 Initializing parameters")
+    start_time = time.time()
     rng = jax.random.PRNGKey(0)
     params = model.init(rng, jnp.ones((1, 256, 256, 3)))
+    elapsed = time.time() - start_time
+    pbar.update(1)
+    pbar.set_postfix({"time": f"{elapsed:.1f}s"})
+    
+    # Step 3: JIT compile
+    pbar.set_description("⚡ JIT compiling model")
+    start_time = time.time()
     apply_fn = jax.jit(functools.partial(model.apply, train=False))
     apply_fn = functools.partial(apply_fn, params)
+    # Trigger compilation with dummy input
+    _ = apply_fn(jnp.ones((1, 256, 256, 3)))
+    elapsed = time.time() - start_time
+    pbar.update(1)
+    pbar.set_postfix({"time": f"{elapsed:.1f}s"})
+    
+    pbar.close()
+    print("✅ InceptionV3 loaded successfully!")
+    print("="*70 + "\n")
+    
     return apply_fn
 
 
