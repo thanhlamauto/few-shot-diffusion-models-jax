@@ -347,6 +347,13 @@ def compute_fid_per_class(p_state, modules, cfg, val_dataset, n_samples, rng, us
     generated_images = generated_images[:n_samples]  # Take first n_samples
     
     # Step 5: Prepare real images (all from the selected class)
+    # Handle case where class has fewer images than n_samples
+    if n_class_images < n_samples:
+        print(f"⚠️  Warning: Class '{class_name}' has only {n_class_images} images, but {n_samples} requested.")
+        print(f"   Will use all {n_class_images} images and adjust generated samples accordingly.")
+        n_samples = n_class_images
+        generated_images = generated_images[:n_samples]
+    
     real_images = class_images[:n_samples]  # (n_samples, C, H, W)
     
     # Convert from (N, C, H, W) to (N, H, W, C) for InceptionV3
@@ -370,15 +377,24 @@ def compute_fid_per_class(p_state, modules, cfg, val_dataset, n_samples, rng, us
         print(f"{'='*70}\n")
         
         # Prepare class info for logging (include sample data for visualization)
+        # Safely get visualization data (handle case with < 18 images)
+        num_viz_samples = min(18, len(generated_images), len(real_images))
+        num_viz_sets = num_viz_samples // 6  # How many complete sets of 6 we can visualize
+        
+        viz_data = {}
+        if num_viz_sets > 0:
+            viz_data = {
+                'viz_support_sets': batch_sets[:num_viz_sets],  # (num_viz_sets, 6, C, H, W)
+                'viz_generated': generated_images[:num_viz_sets*6].reshape(num_viz_sets, 6, C, H, W),
+                'viz_real': real_images[:num_viz_sets*6].reshape(num_viz_sets, 6, C, H, W),
+            }
+        
         class_info = {
             'class_id': selected_class_id,
             'class_name': class_name,
             'n_images': n_samples,
             'total_class_images': n_class_images,
-            # Store first 3 sets for visualization
-            'viz_support_sets': batch_sets[:3],  # (3, 6, C, H, W) - 6 support images each
-            'viz_generated': generated_images[:18].reshape(3, 6, C, H, W),  # (3, 6, C, H, W) - 6 generated per set
-            'viz_real': real_images[:18].reshape(3, 6, C, H, W),  # (3, 6, C, H, W) - 6 real images per set
+            **viz_data  # Merge viz_data if available
         }
         
         return fid_score, class_info
@@ -387,6 +403,7 @@ def compute_fid_per_class(p_state, modules, cfg, val_dataset, n_samples, rng, us
         print(f"❌ Error computing FID: {e}")
         import traceback
         traceback.print_exc()
+        return None  # Explicit return for clarity
         
         class_info = {
             'class_id': selected_class_id,
@@ -610,8 +627,10 @@ def main():
                     samples, support = sample_loop(
                         p_state, modules, cfg, val_loader, args.num_sample_batches, rng, args.use_ddim, args.eta)
 
+                    # Initialize log_dict (will be used for both wandb and non-wandb cases)
+                    log_dict = {"eval_loss": eval_loss}
+                    
                     if args.use_wandb:
-                        log_dict = {"eval_loss": eval_loss}
 
                         # Log samples WITH their corresponding support sets
                         if samples is not None and support is not None:
@@ -696,6 +715,8 @@ def main():
                     # Compute FID if enabled (per-class evaluation)
                     if args.compute_fid and inception_fn is not None:
                         print(f"\nComputing per-class FID at step {global_step}...")
+                        # Note: compute_fid_per_class uses rng internally but doesn't return updated rng
+                        # This is OK because FID computation is deterministic given the selected class
                         fid_result = compute_fid_per_class(
                             p_state, modules, cfg, val_dataset,
                             args.fid_num_samples, rng, args.use_ddim, args.eta, inception_fn
@@ -711,73 +732,76 @@ def main():
                             logger.logkv("fid", fid_score)
                             logger.dumpkvs(global_step)
                         
-                            if args.use_wandb and class_info:
+                            # Add FID metrics to log_dict (always, not just when use_wandb)
+                            if class_info:
                                 log_dict["fid/score"] = fid_score
                                 log_dict["fid/class_id"] = class_info.get('class_id', -1)
                                 log_dict["fid/class_name"] = class_info.get('class_name', 'unknown')
                                 log_dict["fid/n_images"] = class_info.get('n_images', 0)
                                 log_dict["fid/total_class_images"] = class_info.get('total_class_images', 0)
                             
-                                # Optional: Log example visualizations (support | generated | real)
-                                try:
-                                    if 'viz_support_sets' in class_info and 'viz_generated' in class_info:
-                                        viz_support = class_info['viz_support_sets']  # (3, 6, C, H, W)
-                                        viz_gen = class_info['viz_generated']          # (3, 6, C, H, W)
-                                        viz_real = class_info['viz_real']              # (3, 6, C, H, W)
+                                # Optional: Log example visualizations (support | generated | real) - only if use_wandb
+                                if args.use_wandb:
+                                    try:
+                                        if 'viz_support_sets' in class_info and 'viz_generated' in class_info:
+                                            viz_support = class_info['viz_support_sets']  # (num_viz_sets, 6, C, H, W)
+                                            viz_gen = class_info['viz_generated']          # (num_viz_sets, 6, C, H, W)
+                                            viz_real = class_info['viz_real']              # (num_viz_sets, 6, C, H, W)
                                     
-                                        # Show first 3 examples
-                                        for i in range(min(3, len(viz_support))):
-                                            # Create figure: 3 rows x 6 columns
-                                            # Row 0: Support images (blue)
-                                            # Row 1: Generated images (green)
-                                            # Row 2: Real images (red)
-                                            fig, axes = plt.subplots(3, 6, figsize=(12, 6))
+                                            # Show first 3 examples (or fewer if not available)
+                                            num_examples = min(3, len(viz_support))
+                                            for i in range(num_examples):
+                                                # Create figure: 3 rows x 6 columns
+                                                # Row 0: Support images (blue)
+                                                # Row 1: Generated images (green)
+                                                # Row 2: Real images (red)
+                                                fig, axes = plt.subplots(3, 6, figsize=(12, 6))
                                         
-                                            # Row 0: Support images
-                                            for j in range(6):
-                                                support_img = viz_support[i, j].transpose(1, 2, 0)
-                                                support_img = np.clip((support_img + 1) / 2, 0, 1)
-                                                axes[0, j].imshow(support_img)
-                                                if j == 3:
-                                                    axes[0, j].set_title('Support Set', fontsize=9)
-                                                axes[0, j].axis('off')
-                                                for spine in axes[0, j].spines.values():
-                                                    spine.set_edgecolor('blue')
-                                                    spine.set_linewidth(2)
+                                                # Row 0: Support images
+                                                for j in range(6):
+                                                    support_img = viz_support[i, j].transpose(1, 2, 0)
+                                                    support_img = np.clip((support_img + 1) / 2, 0, 1)
+                                                    axes[0, j].imshow(support_img)
+                                                    if j == 3:
+                                                        axes[0, j].set_title('Support Set', fontsize=9)
+                                                    axes[0, j].axis('off')
+                                                    for spine in axes[0, j].spines.values():
+                                                        spine.set_edgecolor('blue')
+                                                        spine.set_linewidth(2)
                                         
-                                            # Row 1: Generated images
-                                            for j in range(6):
-                                                gen_img = viz_gen[i, j].transpose(1, 2, 0)
-                                                gen_img = np.clip((gen_img + 1) / 2, 0, 1)
-                                                axes[1, j].imshow(gen_img)
-                                                if j == 3:
-                                                    axes[1, j].set_title('Generated', fontsize=9, weight='bold')
-                                                axes[1, j].axis('off')
-                                                for spine in axes[1, j].spines.values():
-                                                    spine.set_edgecolor('green')
-                                                    spine.set_linewidth(2)
+                                                # Row 1: Generated images
+                                                for j in range(6):
+                                                    gen_img = viz_gen[i, j].transpose(1, 2, 0)
+                                                    gen_img = np.clip((gen_img + 1) / 2, 0, 1)
+                                                    axes[1, j].imshow(gen_img)
+                                                    if j == 3:
+                                                        axes[1, j].set_title('Generated', fontsize=9, weight='bold')
+                                                    axes[1, j].axis('off')
+                                                    for spine in axes[1, j].spines.values():
+                                                        spine.set_edgecolor('green')
+                                                        spine.set_linewidth(2)
                                         
-                                            # Row 2: Real images
-                                            for j in range(6):
-                                                real_img = viz_real[i, j].transpose(1, 2, 0)
-                                                real_img = np.clip((real_img + 1) / 2, 0, 1)
-                                                axes[2, j].imshow(real_img)
-                                                if j == 3:
-                                                    axes[2, j].set_title('Real', fontsize=9)
-                                                axes[2, j].axis('off')
-                                                for spine in axes[2, j].spines.values():
-                                                    spine.set_edgecolor('red')
-                                                    spine.set_linewidth(2)
+                                                # Row 2: Real images
+                                                for j in range(6):
+                                                    real_img = viz_real[i, j].transpose(1, 2, 0)
+                                                    real_img = np.clip((real_img + 1) / 2, 0, 1)
+                                                    axes[2, j].imshow(real_img)
+                                                    if j == 3:
+                                                        axes[2, j].set_title('Real', fontsize=9)
+                                                    axes[2, j].axis('off')
+                                                    for spine in axes[2, j].spines.values():
+                                                        spine.set_edgecolor('red')
+                                                        spine.set_linewidth(2)
                                         
-                                            class_name = class_info.get('class_name', 'unknown')
-                                            plt.suptitle(f'FID Evaluation Set {i+1} (Class: {class_name})\n'
-                                                       f'Blue=Support | Green=Generated | Red=Real', 
-                                                       fontsize=11, weight='bold')
-                                            plt.tight_layout()
-                                            log_dict[f"fid_eval/example_{i}"] = wandb.Image(fig)
-                                            plt.close(fig)
-                                except Exception as e:
-                                    logger.log(f"Could not create FID visualization: {e}")
+                                                class_name = class_info.get('class_name', 'unknown')
+                                                plt.suptitle(f'FID Evaluation Set {i+1} (Class: {class_name})\n'
+                                                           f'Blue=Support | Green=Generated | Red=Real', 
+                                                           fontsize=11, weight='bold')
+                                                plt.tight_layout()
+                                                log_dict[f"fid_eval/example_{i}"] = wandb.Image(fig)
+                                                plt.close(fig)
+                                    except Exception as e:
+                                        logger.log(f"Could not create FID visualization: {e}")
 
                     if args.use_wandb:
                         wandb.log(log_dict, step=global_step)
@@ -824,11 +848,11 @@ def create_argparser():
         image_size=32,
         sample_size=5,
         patch_size=8,
-        hdim=450,  # Optimal for depth=6 to match ~43.5M params
+        hdim=448,  # Must be divisible by 4 for positional embeddings (depth=6, ~43M params)
         in_channels=3,
         encoder_mode="vit_set",
         pool="cls",
-        context_channels=450,  # Match with hidden_size
+        context_channels=448,  # Match with hidden_size (must be divisible by 4)
         mode_context="deterministic",
         mode_conditioning="film",
         augment=False,
