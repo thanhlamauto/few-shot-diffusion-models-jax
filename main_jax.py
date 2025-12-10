@@ -444,6 +444,106 @@ def main():
 
     params, modules, cfg = select_model_jax(args, rng_model)
 
+    # Count and log parameters
+    def count_params(params_dict):
+        """Count total parameters in nested dict."""
+        total = 0
+        breakdown = {}
+        for key, param_tree in params_dict.items():
+            count = sum(np.prod(p.shape) for p in jax.tree_util.tree_leaves(param_tree))
+            breakdown[key] = count
+            total += count
+        return total, breakdown
+
+    total_params, param_breakdown = count_params(params)
+    
+    logger.log(f"\n{'='*70}")
+    logger.log(f"MODEL ARCHITECTURE SUMMARY")
+    logger.log(f"{'='*70}")
+    
+    # Encoder info
+    logger.log(f"\n📦 ENCODER ({cfg.encoder_mode.upper()}):")
+    logger.log(f"  Type: {cfg.encoder_mode}")
+    logger.log(f"  Hidden dim (hdim): {cfg.hdim}")
+    logger.log(f"  Image size: {cfg.image_size}×{cfg.image_size}")
+    logger.log(f"  Patch size: {cfg.patch_size}")
+    logger.log(f"  Sample size (ns): {cfg.sample_size}")
+    logger.log(f"  Pool mode: {cfg.pool}")
+    
+    # Encoder architecture (hardcoded in build_encoder in vfsddpm_jax.py)
+    # ⚠️ If you want to change encoder depth/heads, edit build_encoder() function!
+    if cfg.encoder_mode == "vit":
+        enc_depth = 6
+        enc_heads = 12
+        enc_mlp_dim = cfg.hdim
+        enc_dim_head = 64
+        logger.log(f"  Depth: {enc_depth} layers (standard ViT)")
+    else:  # vit_set (sViT)
+        enc_depth = 6  # ⚠️ HARDCODED in vfsddpm_jax.py line 85
+        enc_heads = 12  # ⚠️ HARDCODED in vfsddpm_jax.py line 86
+        enc_mlp_dim = cfg.hdim
+        enc_dim_head = 64
+        num_patches = (cfg.image_size // cfg.patch_size) ** 2
+        logger.log(f"  Depth: {enc_depth} layers (sViT with LSA)")
+        logger.log(f"  Num patches: {num_patches}")
+        logger.log(f"  ⚠️  Note: Encoder depth/heads are HARDCODED in vfsddpm_jax.py")
+    
+    logger.log(f"  Attention heads: {enc_heads}")
+    logger.log(f"  Dim per head: {enc_dim_head}")
+    logger.log(f"  MLP dim: {enc_mlp_dim}")
+    logger.log(f"  Parameters: {param_breakdown.get('encoder', 0):,} ({param_breakdown.get('encoder', 0)/1e6:.2f}M)")
+    
+    # Detailed encoder param breakdown
+    if cfg.encoder_mode == "vit_set":
+        # Calculate theoretical params for sViT
+        patch_dim = cfg.patch_size * cfg.patch_size * cfg.sample_size * cfg.in_channels
+        spt_params = patch_dim * cfg.hdim + cfg.hdim + 2 * cfg.hdim  # Dense + LayerNorm
+        pos_emb_params = (num_patches + 2) * cfg.hdim + cfg.hdim  # pos_embedding + cls_token
+        
+        # Per transformer layer
+        inner_dim = enc_heads * enc_dim_head
+        lsa_params = cfg.hdim * inner_dim * 3 + inner_dim * cfg.hdim + 1  # QKV + out + temperature
+        ff_params = cfg.hdim * enc_mlp_dim + enc_mlp_dim + enc_mlp_dim * cfg.hdim + cfg.hdim  # 2 Dense
+        ln_params = 2 * (2 * cfg.hdim)  # 2 LayerNorms per layer
+        layer_params = lsa_params + ff_params + ln_params
+        
+        logger.log(f"    └─ SPT: ~{spt_params/1e3:.1f}K")
+        logger.log(f"    └─ Pos Emb: ~{pos_emb_params/1e3:.1f}K")
+        logger.log(f"    └─ Transformer: {enc_depth} × ~{layer_params/1e6:.2f}M = ~{enc_depth*layer_params/1e6:.2f}M")
+        logger.log(f"    └─ MLP Head: ~{(cfg.hdim * cfg.hdim + cfg.hdim + 2*cfg.hdim)/1e3:.1f}K")
+    
+    # DiT info
+    logger.log(f"\n🔷 DiT MODEL:")
+    logger.log(f"  Hidden size: {cfg.hidden_size}")
+    logger.log(f"  Depth: {cfg.depth} layers")
+    logger.log(f"  Attention heads: {cfg.num_heads}")
+    logger.log(f"  MLP ratio: {cfg.mlp_ratio}")
+    logger.log(f"  Patch size: {cfg.patch_size}")
+    logger.log(f"  Conditioning: {cfg.mode_conditioning}")
+    logger.log(f"  Context channels: {cfg.context_channels}")
+    logger.log(f"  Parameters: {param_breakdown.get('dit', 0):,} ({param_breakdown.get('dit', 0)/1e6:.2f}M)")
+    
+    # Diffusion info
+    logger.log(f"\n🌊 DIFFUSION:")
+    logger.log(f"  Steps: {cfg.diffusion_steps}")
+    logger.log(f"  Noise schedule: {cfg.noise_schedule}")
+    logger.log(f"  Learn sigma: {cfg.learn_sigma}")
+    
+    # Posterior (if variational)
+    if 'posterior' in param_breakdown:
+        logger.log(f"\n🎲 POSTERIOR (Variational):")
+        logger.log(f"  Mode: {cfg.mode_context}")
+        logger.log(f"  Parameters: {param_breakdown['posterior']:,} ({param_breakdown['posterior']/1e6:.2f}M)")
+    
+    # Total
+    logger.log(f"\n{'='*70}")
+    logger.log(f"TOTAL PARAMETERS: {total_params:,} ({total_params/1e6:.2f}M)")
+    logger.log(f"  Encoder: {param_breakdown.get('encoder', 0)/1e6:.2f}M ({param_breakdown.get('encoder', 0)/total_params*100:.1f}%)")
+    logger.log(f"  DiT:     {param_breakdown.get('dit', 0)/1e6:.2f}M ({param_breakdown.get('dit', 0)/total_params*100:.1f}%)")
+    if 'posterior' in param_breakdown:
+        logger.log(f"  Posterior: {param_breakdown['posterior']/1e6:.2f}M ({param_breakdown['posterior']/total_params*100:.1f}%)")
+    logger.log(f"{'='*70}\n")
+
     # Train state and optimizer
     state, tx = create_train_state_pmap(
         params,
@@ -539,6 +639,31 @@ def main():
                 # host metrics
                 metrics_host = jax.tree.map(lambda x: np.array(x).mean(), metrics)
                 global_step += 1
+
+                # Debug logging for first 10 iterations
+                if global_step <= 10:
+                    logger.log(f"\n{'='*70}")
+                    logger.log(f"📊 ITERATION {global_step} - SHAPE & METRICS DEBUG")
+                    logger.log(f"{'='*70}")
+                    logger.log(f"Batch (before shard): {batch_np.shape}")
+                    logger.log(f"  → (bs={batch_np.shape[0]}, ns={batch_np.shape[1]}, C={batch_np.shape[2]}, H={batch_np.shape[3]}, W={batch_np.shape[4]})")
+                    logger.log(f"Batch (after shard):  {batch_sharded.shape}")
+                    logger.log(f"  → n_devices={n_devices}, per_device_bs={batch_sharded.shape[1] if len(batch_sharded.shape) > 1 else 'N/A'}")
+                    logger.log(f"\nMetrics:")
+                    for k, v in metrics_host.items():
+                        if isinstance(v, (int, float, np.number)):
+                            logger.log(f"  {k}: {float(v):.6f}")
+                        elif isinstance(v, np.ndarray) and v.size == 1:
+                            logger.log(f"  {k}: {float(v.item()):.6f}")
+                    
+                    # Log gradient norms if available
+                    if 'grad_norm_encoder' in metrics_host:
+                        logger.log(f"\n🔍 Gradient Norms:")
+                        logger.log(f"  Encoder: {float(metrics_host['grad_norm_encoder']):.6f}")
+                        if 'grad_norm_dit' in metrics_host:
+                            logger.log(f"  DiT:     {float(metrics_host['grad_norm_dit']):.6f}")
+                    
+                    logger.log(f"{'='*70}\n")
 
                 # Update progress bar with metrics
                 pbar.set_postfix({
