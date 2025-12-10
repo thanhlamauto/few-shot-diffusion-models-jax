@@ -19,7 +19,7 @@ import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server use
 import matplotlib.pyplot as plt
 
-from dataset import create_loader
+from dataset import create_loader, select_dataset
 from model import select_model  # keeps existing namespace for non-JAX
 from model.select_model_jax import select_model_jax
 from model.vfsddpm_jax import vfsddpm_loss, leave_one_out_c
@@ -209,7 +209,7 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta):
         np.concatenate(all_support, axis=0) if all_support else None
 
 
-def compute_fid_per_class(p_state, modules, cfg, val_loader, n_samples, rng, use_ddim, eta, inception_fn):
+def compute_fid_per_class(p_state, modules, cfg, val_dataset, n_samples, rng, use_ddim, eta, inception_fn):
     """
     Compute FID score for a single randomly selected class.
     
@@ -224,7 +224,7 @@ def compute_fid_per_class(p_state, modules, cfg, val_loader, n_samples, rng, use
         p_state: Parallel training state with EMA parameters
         modules: Dict of model modules
         cfg: Model configuration
-        val_loader: Validation data loader
+        val_dataset: Validation dataset (BaseSetsDataset object)
         n_samples: Number of samples to generate for FID (default 600)
         rng: JAX random key
         use_ddim: Whether to use DDIM sampling
@@ -243,9 +243,9 @@ def compute_fid_per_class(p_state, modules, cfg, val_loader, n_samples, rng, use
     print(f"{'='*70}")
     
     # Step 1: Random class selection
-    dataset = val_loader.dataset
+    dataset = val_dataset
     if dataset is None:
-        raise ValueError("Cannot access dataset from val_loader")
+        raise ValueError("val_dataset is None")
     
     # Get all unique class IDs from the dataset
     all_targets = dataset.data['targets']  # (n_sets, ns)
@@ -444,6 +444,10 @@ def main():
     # Data loaders (PyTorch) on CPU
     train_loader = create_loader(args, split="train", shuffle=True)
     val_loader = create_loader(args, split="val", shuffle=False)
+    
+    # Store validation dataset separately for FID computation
+    # (val_loader is a generator, doesn't have .dataset attribute)
+    val_dataset = select_dataset(args, split="val")
 
     # Initialize InceptionV3 for FID computation (if enabled)
     inception_fn = None
@@ -693,7 +697,7 @@ def main():
                     if args.compute_fid and inception_fn is not None:
                         print(f"\nComputing per-class FID at step {global_step}...")
                         fid_result = compute_fid_per_class(
-                            p_state, modules, cfg, val_loader,
+                            p_state, modules, cfg, val_dataset,
                             args.fid_num_samples, rng, args.use_ddim, args.eta, inception_fn
                         )
                     
