@@ -111,7 +111,13 @@ def get_fid_fn():
     pbar.set_description("🔧 Initializing parameters")
     start_time = time.time()
     rng = jax.random.PRNGKey(0)
-    params = model.init(rng, jnp.ones((1, 256, 256, 3)))
+    
+    # InceptionV3 expects 299x299 input (standard InceptionV3 architecture requirement)
+    # Note: Input images of any size will be automatically resized to 299x299 in extract_features_batch()
+    # Format: (batch_size, height, width, channels) = (1, 299, 299, 3)
+    INCEPTION_INPUT_SIZE = 299
+    init_shape = (1, INCEPTION_INPUT_SIZE, INCEPTION_INPUT_SIZE, 3)
+    params = model.init(rng, jnp.ones(init_shape))
     elapsed = time.time() - start_time
     pbar.update(1)
     pbar.set_postfix({"time": f"{elapsed:.1f}s"})
@@ -121,8 +127,8 @@ def get_fid_fn():
     start_time = time.time()
     apply_fn = jax.jit(functools.partial(model.apply, train=False))
     apply_fn = functools.partial(apply_fn, params)
-    # Trigger compilation with dummy input
-    _ = apply_fn(jnp.ones((1, 256, 256, 3)))
+    # Trigger compilation with dummy input (must match init shape)
+    _ = apply_fn(jnp.ones(init_shape))
     elapsed = time.time() - start_time
     pbar.update(1)
     pbar.set_postfix({"time": f"{elapsed:.1f}s"})
@@ -150,12 +156,21 @@ def extract_features_batch(inception_fn, images, batch_size=128):
         raise ValueError("InceptionV3 function not available")
 
     n_images = images.shape[0]
+    original_h, original_w = images.shape[1], images.shape[2]
+    
+    # Log resize info if needed
+    if original_h != 299 or original_w != 299:
+        scale_factor = 299 / max(original_h, original_w)
+        print(f"  📏 Resizing images: {original_h}×{original_w} → 299×299 (scale: {scale_factor:.2f}×)")
+        if scale_factor > 2.0:
+            print(f"  ⚠️  Warning: Large upscaling ({scale_factor:.1f}×) may affect FID accuracy for low-res images")
+    
     features_list = []
 
     for i in range(0, n_images, batch_size):
         batch = images[i:i+batch_size]
 
-        # Resize to 299x299 if needed (InceptionV3 input size)
+        # Resize to 299x299 if needed (InceptionV3 standard input size)
         if batch.shape[1] != 299 or batch.shape[2] != 299:
             batch = jax.image.resize(
                 batch, (batch.shape[0], 299, 299, 3), method='bilinear')
@@ -184,6 +199,24 @@ def compute_fid(real_images, fake_images, inception_fn=None, batch_size=128):
     Returns:
         fid: FID score
     """
+    # Validate input shapes
+    assert real_images.ndim == 4, f"real_images must be 4D (N,H,W,C), got shape {real_images.shape}"
+    assert fake_images.ndim == 4, f"fake_images must be 4D (N,H,W,C), got shape {fake_images.shape}"
+    assert real_images.shape[1] == fake_images.shape[1], \
+        f"Height mismatch: real={real_images.shape[1]}, fake={fake_images.shape[1]}"
+    assert real_images.shape[2] == fake_images.shape[2], \
+        f"Width mismatch: real={real_images.shape[2]}, fake={fake_images.shape[2]}"
+    assert real_images.shape[3] == 3, f"Expected 3 channels (RGB), got {real_images.shape[3]}"
+    assert fake_images.shape[3] == 3, f"Expected 3 channels (RGB), got {fake_images.shape[3]}"
+    
+    # Validate value range
+    real_min, real_max = real_images.min(), real_images.max()
+    fake_min, fake_max = fake_images.min(), fake_images.max()
+    if real_min < -1.1 or real_max > 1.1:
+        print(f"⚠️  Warning: real_images range [{real_min:.2f}, {real_max:.2f}] outside expected [-1, 1]")
+    if fake_min < -1.1 or fake_max > 1.1:
+        print(f"⚠️  Warning: fake_images range [{fake_min:.2f}, {fake_max:.2f}] outside expected [-1, 1]")
+    
     if inception_fn is None:
         inception_fn = get_fid_fn()
 
@@ -249,6 +282,48 @@ def get(dictionary, key):
     return dictionary[key]
 
 
+def pool(inputs, init, reduce_fn, window_shape, strides, padding):
+    """Helper function for pooling operations."""
+    strides = strides or (1,) * len(window_shape)
+    assert len(window_shape) == len(
+        strides), f"len({window_shape}) == len({strides})"
+    strides = (1,) + strides + (1,)
+    dims = (1,) + window_shape + (1,)
+
+    is_single_input = False
+    if inputs.ndim == len(dims) - 1:
+        inputs = inputs[None]
+        is_single_input = True
+
+    assert inputs.ndim == len(dims), f"len({inputs.shape}) != len({dims})"
+    if not isinstance(padding, str):
+        padding = tuple(map(tuple, padding))
+        assert (len(padding) == len(window_shape)
+                ), f"padding {padding} must specify pads for same number of dims as window_shape {window_shape}"
+        assert (all([len(x) == 2 for x in padding])
+                ), f"each entry in padding {padding} must be length 2"
+        padding = ((0, 0),) + padding + ((0, 0),)
+    y = jax.lax.reduce_window(inputs, init, reduce_fn, dims, strides, padding)
+    if is_single_input:
+        y = jnp.squeeze(y, axis=0)
+    return y
+
+
+def avg_pool(inputs, window_shape, strides=None, padding='VALID'):
+    """Average pooling operation."""
+    assert inputs.ndim == 4
+    assert len(window_shape) == 2
+
+    y = pool(inputs, 0., jax.lax.add, window_shape, strides, padding)
+    ones = jnp.ones(shape=(1, inputs.shape[1], inputs.shape[2], 1)).astype(
+        inputs.dtype)
+    counts = jax.lax.conv_general_dilated(ones, jnp.expand_dims(jnp.ones(window_shape).astype(inputs.dtype), axis=(-2, -1)),
+                                          window_strides=(1, 1), padding=((1, 1), (1, 1)),
+                                          dimension_numbers=nn.linear._conv_dimension_numbers(ones.shape), feature_group_count=1)
+    y = y / counts
+    return y
+
+
 class InceptionV3(nn.Module):
     """
     InceptionV3 network.
@@ -265,7 +340,8 @@ class InceptionV3(nn.Module):
     def setup(self):
         if self.pretrained:
             ckpt_file = download(self.ckpt_path)
-            self.params_dict = pickle.load(open(ckpt_file, 'rb'))
+            with open(ckpt_file, 'rb') as f:
+                self.params_dict = pickle.load(f)
             self.num_classes_ = 1000
         else:
             self.params_dict = None
@@ -619,43 +695,3 @@ class BatchNorm(nn.Module):
                               reduced_feature_shape).reshape(feature_shape)
             y = y + bias
         return jnp.asarray(y, self.dtype)
-
-
-def pool(inputs, init, reduce_fn, window_shape, strides, padding):
-    strides = strides or (1,) * len(window_shape)
-    assert len(window_shape) == len(
-        strides), f"len({window_shape}) == len({strides})"
-    strides = (1,) + strides + (1,)
-    dims = (1,) + window_shape + (1,)
-
-    is_single_input = False
-    if inputs.ndim == len(dims) - 1:
-        inputs = inputs[None]
-        is_single_input = True
-
-    assert inputs.ndim == len(dims), f"len({inputs.shape}) != len({dims})"
-    if not isinstance(padding, str):
-        padding = tuple(map(tuple, padding))
-        assert (len(padding) == len(window_shape)
-                ), f"padding {padding} must specify pads for same number of dims as window_shape {window_shape}"
-        assert (all([len(x) == 2 for x in padding])
-                ), f"each entry in padding {padding} must be length 2"
-        padding = ((0, 0),) + padding + ((0, 0),)
-    y = jax.lax.reduce_window(inputs, init, reduce_fn, dims, strides, padding)
-    if is_single_input:
-        y = jnp.squeeze(y, axis=0)
-    return y
-
-
-def avg_pool(inputs, window_shape, strides=None, padding='VALID'):
-    assert inputs.ndim == 4
-    assert len(window_shape) == 2
-
-    y = pool(inputs, 0., jax.lax.add, window_shape, strides, padding)
-    ones = jnp.ones(shape=(1, inputs.shape[1], inputs.shape[2], 1)).astype(
-        inputs.dtype)
-    counts = jax.lax.conv_general_dilated(ones, jnp.expand_dims(jnp.ones(window_shape).astype(inputs.dtype), axis=(-2, -1)),
-                                          window_strides=(1, 1), padding=((1, 1), (1, 1)),
-                                          dimension_numbers=nn.linear._conv_dimension_numbers(ones.shape), feature_group_count=1)
-    y = y / counts
-    return y
