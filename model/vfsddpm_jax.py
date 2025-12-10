@@ -333,6 +333,8 @@ def vfsddpm_loss(
         total = total + klc
         losses["klc"] = klc
     losses["loss"] = total
+    # Add context for debugging
+    losses["context"] = c
     return losses
 
 

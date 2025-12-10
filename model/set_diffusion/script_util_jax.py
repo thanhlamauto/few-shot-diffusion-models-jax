@@ -40,12 +40,12 @@ def dit_model_defaults():
     res = dict(
         image_size=32,
         in_channels=3,
-        hidden_size=768,  # DiT hidden dimension (thay cho num_channels)
-        depth=12,  # DiT depth (thay cho num_res_blocks)
-        num_heads=12,  # DiT attention heads
+        hidden_size=450,  # DiT hidden dimension (optimal for ~43.5M params with depth=6)
+        depth=6,  # DiT depth (reduced from 12 for faster training & better gradient flow)
+        num_heads=9,  # DiT attention heads (450/9 = 50 head_dim)
         mlp_ratio=4.0,  # DiT MLP expansion ratio
         patch_size=2,  # DiT patch size
-        context_channels=256,  # Few-shot conditioning dimension
+        context_channels=450,  # Few-shot conditioning dimension (match hidden_size)
         mode_conditioning="film",  # "film" or "lag"
         dropout=0.0,
         class_cond=False,

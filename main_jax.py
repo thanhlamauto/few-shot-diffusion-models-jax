@@ -826,11 +826,11 @@ def create_argparser():
         image_size=32,
         sample_size=5,
         patch_size=8,
-        hdim=384,  # Match with hidden_size for optimal context usage
+        hdim=450,  # Optimal for depth=6 to match ~43.5M params
         in_channels=3,
         encoder_mode="vit_set",
         pool="cls",
-        context_channels=384,  # Match with hidden_size (no projection needed)
+        context_channels=450,  # Match with hidden_size
         mode_context="deterministic",
         mode_conditioning="film",
         augment=False,

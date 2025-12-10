@@ -196,7 +196,7 @@ def train_step_pmap(
 ):
     """
     Returns a pmapped train step: state, batch, rng -> (state, metrics).
-    loss_fn(params, batch, rng) should return dict with key 'loss'.
+    loss_fn(params, batch, rng) should return dict with key 'loss' and optionally 'context'.
     """
 
     def step(state: TrainStatePmap, batch, rng):
@@ -221,6 +221,38 @@ def train_step_pmap(
         if isinstance(losses, dict):
             for k, v in losses.items():
                 metrics[k] = v
+        
+        # Compute debug metrics
+        # 1. Context magnitude (if available)
+        if "context" in losses and losses["context"] is not None:
+            context = losses["context"]
+            metrics["debug/context_norm"] = jnp.linalg.norm(context)
+            metrics["debug/context_mean"] = jnp.mean(jnp.abs(context))
+            metrics["debug/context_max"] = jnp.max(jnp.abs(context))
+            metrics["debug/context_std"] = jnp.std(context)
+        
+        # 2. Gradient norms (layer-wise)
+        if hasattr(grads, 'keys'):
+            # Compute gradient norm for each parameter group
+            for key in ['dit', 'encoder']:
+                if key in grads and grads[key] is not None:
+                    grad_tree = grads[key]
+                    # Flatten all gradients in this tree
+                    flat_grads = jax.tree_util.tree_leaves(grad_tree)
+                    if flat_grads:
+                        # Compute L2 norm of all gradients
+                        grad_norm = jnp.sqrt(sum(jnp.sum(g**2) for g in flat_grads if g is not None))
+                        metrics[f"debug/grad_norm_{key}"] = grad_norm
+        
+        # 3. Parameter norms (for reference)
+        for key in ['dit', 'encoder']:
+            if key in new_params and new_params[key] is not None:
+                param_tree = new_params[key]
+                flat_params = jax.tree_util.tree_leaves(param_tree)
+                if flat_params:
+                    param_norm = jnp.sqrt(sum(jnp.sum(p**2) for p in flat_params if p is not None))
+                    metrics[f"debug/param_norm_{key}"] = param_norm
+        
         return new_state, metrics
 
     return jax.pmap(step, axis_name="devices")
