@@ -247,8 +247,17 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
         (1, cfg.in_channels, cfg.image_size, cfg.image_size), dtype=jnp.float32
     )
     dummy_t = jnp.zeros((1,), dtype=jnp.int32)
+    
+    # CRITICAL: For lag mode, must provide dummy context to init cross-attention layers
+    if cfg.mode_conditioning == "lag":
+        # Create dummy context tokens: (b, num_patches, context_channels)
+        num_patches = (cfg.image_size // cfg.patch_size) ** 2
+        dummy_c = jnp.zeros((1, num_patches, cfg.context_channels), dtype=jnp.float32)
+    else:
+        dummy_c = None
+    
     dit_params = dit.init(rng_dit, dummy_x, dummy_t,
-                          c=None, y=None, train=False)
+                          c=dummy_c, y=None, train=False)
 
     params = {"encoder": enc_params, "dit": dit_params}
     modules = {"encoder": enc, "dit": dit, "diffusion": diffusion}
