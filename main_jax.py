@@ -188,8 +188,10 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta):
         b, ns, c, h, w = batch_np.shape
         rng, sub = jax.random.split(rng)
         # build conditioning c (host-side, deterministic)
+        # Create dummy timestep for encoding (encoder needs t for time_embed)
+        t_dummy = jnp.zeros((b,), dtype=jnp.int32)
         c_cond, _ = leave_one_out_c(sub, {"encoder": ema_params["encoder"], "posterior": ema_params.get(
-            "posterior")}, modules, batch_np, cfg, train=False)
+            "posterior"), "time_embed": ema_params.get("time_embed")}, modules, batch_np, cfg, train=False, t=t_dummy)
         # sampling shape
         shape = (b * ns, c, h, w)
         # model_apply using ema_params["dit"]
@@ -333,10 +335,13 @@ def compute_fid_per_class(p_state, modules, cfg, val_dataset, n_samples, rng, us
         
         # Get conditioning via leave-one-out (creates bs*actual_ns conditionings)
         sub = {"encoder": ema_params["encoder"],
-               "posterior": ema_params.get("posterior")}
+               "posterior": ema_params.get("posterior"),
+               "time_embed": ema_params.get("time_embed")}
         rng, cond_rng = jax.random.split(rng)
+        # Create dummy timestep for encoding
+        t_dummy = jnp.zeros((bs,), dtype=jnp.int32)
         c_cond, _ = leave_one_out_c(
-            cond_rng, sub, modules, mini_batch, cfg_fid, train=False)
+            cond_rng, sub, modules, mini_batch, cfg_fid, train=False, t=t_dummy)
         
         # c_cond shape: (bs * actual_ns, hdim) - one conditioning per image
         # Generate bs*actual_ns samples (actual_ns per set)
@@ -417,14 +422,190 @@ def compute_fid_per_class(p_state, modules, cfg, val_dataset, n_samples, rng, us
         import traceback
         traceback.print_exc()
         return None  # Explicit return for clarity
+
+
+def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, use_ddim, eta, inception_fn, args):
+    """
+    Compute FID on mixture distribution of multiple classes (Paper methodology).
+    
+    Following paper Section 4.1:
+    - In-distribution: Generate from TRAIN classes (classes seen during training)
+    - Out-distribution: Generate from TEST classes (unseen/few-shot classes)
+    - Generate n_samples conditioned on support sets from multiple classes
+    - Compare with real images from the same class pool (mixture distribution)
+    
+    Args:
+        p_state: Parallel training state with EMA parameters
+        modules: Dict of model modules
+        cfg: Model configuration
+        dataset_split: "train" for In-distribution, "test" for Out-distribution
+        n_samples: Total number of samples to generate (e.g., 10000)
+        rng: JAX random key
+        use_ddim: Whether to use DDIM sampling
+        eta: DDIM eta parameter
+        inception_fn: InceptionV3 apply function
+        args: Command line arguments
         
-        class_info = {
-            'class_id': selected_class_id,
-            'class_name': class_name,
-            'n_images': n_samples,
-            'total_class_images': n_class_images
+    Returns:
+        fid_score: FID score for the mixture
+        info: Dict with metadata
+    """
+    from model.vfsddpm_jax import leave_one_out_c
+    from model.set_diffusion.train_util_jax import sample_ema
+    import flax
+    import copy
+    
+    dist_name = "IN" if dataset_split == "train" else "OUT"
+    print(f"\n{'='*70}")
+    print(f"Computing {dist_name}-Distribution FID (Mixture of Multiple Classes)")
+    print(f"Target: {n_samples} samples from {dataset_split} classes")
+    print(f"{'='*70}")
+    
+    # Step 1: Load dataset for the specified split
+    print(f"\n📂 Loading {dataset_split} dataset...")
+    from dataset import select_dataset
+    
+    args_copy = copy.copy(args)
+    dataset = select_dataset(args_copy, split=dataset_split)
+    
+    # Get all unique classes in this split
+    all_targets = dataset.data['targets']  # (n_sets, ns)
+    unique_classes = np.unique(all_targets)
+    n_classes = len(unique_classes)
+    
+    print(f"✅ Found {n_classes} unique classes in {dataset_split} split")
+    if n_classes <= 20:
+        class_names = [dataset.map_cls.get(cid, f"class_{cid}") for cid in unique_classes]
+        print(f"   Classes: {class_names}")
+    else:
+        print(f"   First 10 classes: {unique_classes[:10].tolist()}...")
+    
+    # Step 2: Organize images by class
+    print(f"\n🗂️  Organizing images by class...")
+    class_image_pools = {}
+    
+    for class_id in unique_classes:
+        class_mask = (all_targets == class_id).any(axis=1)
+        class_sets = dataset.data['inputs'][class_mask]
+        class_labels = dataset.data['targets'][class_mask]
+        
+        class_images_flat = class_sets.reshape(-1, *class_sets.shape[2:])
+        class_labels_flat = class_labels.reshape(-1)
+        class_images = class_images_flat[class_labels_flat == class_id]
+        
+        class_image_pools[class_id] = class_images
+    
+    total_real_images = sum(len(imgs) for imgs in class_image_pools.values())
+    print(f"✅ Organized {total_real_images} images across {n_classes} classes")
+    print(f"   Per class: min={min(len(imgs) for imgs in class_image_pools.values())}, "
+          f"max={max(len(imgs) for imgs in class_image_pools.values())}, "
+          f"avg={total_real_images/n_classes:.1f}")
+    
+    # Step 3: Generate samples from mixture
+    print(f"\n🎨 Generating {n_samples} samples from class mixture...")
+    print(f"   Strategy: Random class selection → Sample support set → Generate via leave-one-out")
+    
+    ns = cfg.sample_size
+    all_generated = []
+    all_real_for_fid = []
+    class_usage = {cid: 0 for cid in unique_classes}
+    
+    ema_params = flax.jax_utils.unreplicate(p_state.ema_params)
+    C, H, W = dataset.data['inputs'].shape[2], dataset.data['inputs'].shape[3], dataset.data['inputs'].shape[4]
+    
+    pbar = tqdm(total=n_samples, desc=f"{dist_name}-dist generation", unit="images")
+    
+    generated_count = 0
+    while generated_count < n_samples:
+        # Randomly select a class (uniform over classes)
+        selected_class = np.random.choice(unique_classes)
+        class_images = class_image_pools[selected_class]
+        
+        # Sample support set from this class (with replacement)
+        support_indices = np.random.choice(len(class_images), size=ns, replace=True)
+        support_set = class_images[support_indices]  # (ns, C, H, W)
+        
+        # Generate ns images conditioned on this support set
+        mini_batch = support_set[None, ...]  # (1, ns, C, H, W)
+        
+        sub = {"encoder": ema_params["encoder"],
+               "posterior": ema_params.get("posterior"),
+               "time_embed": ema_params.get("time_embed")}
+        rng, cond_rng = jax.random.split(rng)
+        
+        # Create dummy timestep for encoding (encoder needs t for time_embed)
+        t_dummy = jnp.zeros((1,), dtype=jnp.int32)
+        c_cond, _ = leave_one_out_c(
+            cond_rng, sub, modules, mini_batch, cfg, train=False, t=t_dummy)
+        
+        diffusion = modules["diffusion"]
+        model_apply = modules["dit"].apply
+        shape = (ns, C, H, W)
+        
+        rng, sample_rng = jax.random.split(rng)
+        samples = sample_ema(
+            sample_rng, ema_params["dit"], diffusion, model_apply,
+            shape, conditioning=c_cond, use_ddim=use_ddim, eta=eta
+        )
+        
+        all_generated.append(np.array(samples))
+        
+        # Collect corresponding real images (random from same class)
+        real_indices = np.random.choice(len(class_images), size=ns, replace=True)
+        all_real_for_fid.append(class_images[real_indices])
+        
+        class_usage[selected_class] += ns
+        generated_count += ns
+        pbar.update(ns)
+    
+    pbar.close()
+    
+    # Step 4: Finalize arrays
+    generated_images = np.concatenate(all_generated, axis=0)[:n_samples]
+    real_images = np.concatenate(all_real_for_fid, axis=0)[:n_samples]
+    
+    classes_used = [cid for cid, count in class_usage.items() if count > 0]
+    print(f"\n📊 Class distribution in {n_samples} samples:")
+    print(f"   Used {len(classes_used)}/{n_classes} classes")
+    top_5 = sorted(class_usage.items(), key=lambda x: -x[1])[:5]
+    top_5_names = [(dataset.map_cls.get(cid, f"class_{cid}"), count) for cid, count in top_5]
+    print(f"   Top 5 classes: {top_5_names}")
+    
+    # Convert to HWC
+    generated_hwc = generated_images.transpose(0, 2, 3, 1)
+    real_hwc = real_images.transpose(0, 2, 3, 1)
+    
+    print(f"\n✅ Final shapes:")
+    print(f"   Generated: {generated_hwc.shape}")
+    print(f"   Real: {real_hwc.shape}")
+    
+    # Step 5: Compute FID
+    try:
+        print(f"\n🔄 Computing FID on {dist_name}-distribution mixture...")
+        fid_score = fid_jax.compute_fid(
+            real_hwc,
+            generated_hwc,
+            inception_fn=inception_fn,
+            batch_size=256
+        )
+        print(f"✅ FID Score ({dist_name}): {fid_score:.2f}")
+        print(f"{'='*70}\n")
+        
+        info = {
+            'split': dataset_split,
+            'distribution': dist_name,
+            'n_samples': n_samples,
+            'n_classes_total': n_classes,
+            'n_classes_used': len(classes_used),
         }
-        return None, class_info
+        
+        return fid_score, info
+        
+    except Exception as e:
+        print(f"❌ Error computing FID: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def main():
@@ -901,96 +1082,66 @@ def main():
                             except Exception as e:
                                 logger.log(f"Could not create support grid: {e}")
 
-                    # Compute FID if enabled (per-class evaluation)
+                    # Compute FID if enabled
                     if args.compute_fid and inception_fn is not None:
-                        print(f"\nComputing per-class FID at step {global_step}...")
-                        # Note: compute_fid_per_class uses rng internally but doesn't return updated rng
-                        # This is OK because FID computation is deterministic given the selected class
-                        fid_result = compute_fid_per_class(
-                            p_state, modules, cfg, val_dataset,
-                            args.fid_num_samples, rng, args.use_ddim, args.eta, inception_fn
-                        )
-                    
-                        if fid_result is not None:
-                            if isinstance(fid_result, tuple):
-                                fid_score, class_info = fid_result
-                            else:
-                                fid_score = fid_result
-                                class_info = {}
+                        fid_mode = getattr(args, 'fid_mode', 'in')
                         
-                            logger.logkv("fid", fid_score)
-                            logger.dumpkvs(global_step)
-                        
-                            # Add FID metrics to log_dict (always, not just when use_wandb)
-                            if class_info:
-                                log_dict["fid/score"] = fid_score
-                                log_dict["fid/class_id"] = class_info.get('class_id', -1)
-                                log_dict["fid/class_name"] = class_info.get('class_name', 'unknown')
-                                log_dict["fid/n_images"] = class_info.get('n_images', 0)
-                                log_dict["fid/total_class_images"] = class_info.get('total_class_images', 0)
+                        if fid_mode == "per_class":
+                            # Legacy per-class FID
+                            print(f"\nComputing per-class FID at step {global_step}...")
+                            fid_result = compute_fid_per_class(
+                                p_state, modules, cfg, val_dataset,
+                                args.fid_num_samples, rng, args.use_ddim, args.eta, inception_fn
+                            )
                             
-                                # Optional: Log example visualizations (support | generated | real) - only if use_wandb
-                                if args.use_wandb:
-                                    try:
-                                        if 'viz_support_sets' in class_info and 'viz_generated' in class_info:
-                                            viz_support = class_info['viz_support_sets']  # (num_viz_sets, 6, C, H, W)
-                                            viz_gen = class_info['viz_generated']          # (num_viz_sets, 6, C, H, W)
-                                            viz_real = class_info['viz_real']              # (num_viz_sets, 6, C, H, W)
+                            if fid_result is not None:
+                                if isinstance(fid_result, tuple):
+                                    fid_score, class_info = fid_result
+                                else:
+                                    fid_score = fid_result
+                                    class_info = {}
+                                
+                                logger.logkv("fid_per_class", fid_score)
+                                logger.dumpkvs(global_step)
+                                
+                                if class_info:
+                                    log_dict["fid/score_per_class"] = fid_score
+                                    log_dict["fid/class_id"] = class_info.get('class_id', -1)
+                                    log_dict["fid/class_name"] = class_info.get('class_name', 'unknown')
+                        
+                        elif fid_mode in ["in", "out", "both"]:
+                            # Paper methodology: mixture FID
+                            splits_to_eval = []
+                            if fid_mode in ["in", "both"]:
+                                splits_to_eval.append("train")
+                            if fid_mode in ["out", "both"]:
+                                splits_to_eval.append("test")
+                            
+                            for split in splits_to_eval:
+                                dist_name = "IN" if split == "train" else "OUT"
+                                print(f"\nComputing {dist_name}-distribution FID at step {global_step}...")
+                                
+                                fid_result = compute_fid_mixture(
+                                    p_state, modules, cfg, split,
+                                    args.fid_num_samples, rng, args.use_ddim, args.eta, inception_fn, args
+                                )
+                                
+                                if fid_result is not None:
+                                    if isinstance(fid_result, tuple):
+                                        fid_score, fid_info = fid_result
+                                    else:
+                                        fid_score = fid_result
+                                        fid_info = {}
                                     
-                                            # Show first 3 examples (or fewer if not available)
-                                            num_examples = min(3, len(viz_support))
-                                            for i in range(num_examples):
-                                                # Create figure: 3 rows x 6 columns
-                                                # Row 0: Support images (blue)
-                                                # Row 1: Generated images (green)
-                                                # Row 2: Real images (red)
-                                                fig, axes = plt.subplots(3, 6, figsize=(12, 6))
-                                        
-                                                # Row 0: Support images
-                                                for j in range(6):
-                                                    support_img = viz_support[i, j].transpose(1, 2, 0)
-                                                    support_img = np.clip((support_img + 1) / 2, 0, 1)
-                                                    axes[0, j].imshow(support_img)
-                                                    if j == 3:
-                                                        axes[0, j].set_title('Support Set', fontsize=9)
-                                                    axes[0, j].axis('off')
-                                                    for spine in axes[0, j].spines.values():
-                                                        spine.set_edgecolor('blue')
-                                                        spine.set_linewidth(2)
-                                        
-                                                # Row 1: Generated images
-                                                for j in range(6):
-                                                    gen_img = viz_gen[i, j].transpose(1, 2, 0)
-                                                    gen_img = np.clip((gen_img + 1) / 2, 0, 1)
-                                                    axes[1, j].imshow(gen_img)
-                                                    if j == 3:
-                                                        axes[1, j].set_title('Generated', fontsize=9, weight='bold')
-                                                    axes[1, j].axis('off')
-                                                    for spine in axes[1, j].spines.values():
-                                                        spine.set_edgecolor('green')
-                                                        spine.set_linewidth(2)
-                                        
-                                                # Row 2: Real images
-                                                for j in range(6):
-                                                    real_img = viz_real[i, j].transpose(1, 2, 0)
-                                                    real_img = np.clip((real_img + 1) / 2, 0, 1)
-                                                    axes[2, j].imshow(real_img)
-                                                    if j == 3:
-                                                        axes[2, j].set_title('Real', fontsize=9)
-                                                    axes[2, j].axis('off')
-                                                    for spine in axes[2, j].spines.values():
-                                                        spine.set_edgecolor('red')
-                                                        spine.set_linewidth(2)
-                                        
-                                                class_name = class_info.get('class_name', 'unknown')
-                                                plt.suptitle(f'FID Evaluation Set {i+1} (Class: {class_name})\n'
-                                                           f'Blue=Support | Green=Generated | Red=Real', 
-                                                           fontsize=11, weight='bold')
-                                                plt.tight_layout()
-                                                log_dict[f"fid_eval/example_{i}"] = wandb.Image(fig)
-                                                plt.close(fig)
-                                    except Exception as e:
-                                        logger.log(f"Could not create FID visualization: {e}")
+                                    logger.logkv(f"fid_{dist_name.lower()}", fid_score)
+                                    logger.dumpkvs(global_step)
+                                    
+                                    if fid_info:
+                                        log_dict[f"fid/{dist_name.lower()}_score"] = fid_score
+                                        log_dict[f"fid/{dist_name.lower()}_n_classes_used"] = fid_info.get('n_classes_used', 0)
+                        
+                        else:
+                            print(f"⚠️  Unknown fid_mode: {fid_mode}, skipping FID computation")
 
                     if args.use_wandb:
                         wandb.log(log_dict, step=global_step)
@@ -1075,7 +1226,8 @@ def create_argparser():
         wandb_project="fsdm-jax",
         wandb_run_name=None,
         compute_fid=False,
-        # Reduced from 4096 for faster eval (still reliable)
+        fid_mode="in",  # "per_class", "in", "out", "both" (in+out)
+        # Reduced from 10000 for faster eval
         fid_num_samples=1024,
         # Log support/target visualization at each log_interval
         log_support_target=True,
