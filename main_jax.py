@@ -7,6 +7,7 @@ This script mirrors the structure of main.py but targets vfsddpm_jax.
 import argparse
 import dataclasses
 import jax
+import jax.numpy as jnp
 import numpy as np
 import flax
 import flax.serialization as serialization
