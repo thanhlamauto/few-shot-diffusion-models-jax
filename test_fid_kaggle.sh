@@ -30,6 +30,8 @@ echo "  Dataset: $DATASET"
 echo "  FID Mode: $FID_MODE"
 echo "  FID Samples: $FID_NUM_SAMPLES"
 echo ""
+echo "Note: max_steps=0 will skip all training and only compute FID"
+echo ""
 
 # Build command
 CMD="python main_jax.py \

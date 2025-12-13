@@ -865,6 +865,52 @@ def main():
     logger.log("starting training (jax pmap)...")
     global_step = 0
     
+    # Special case: If max_steps is 0 and compute_fid is True, only evaluate FID and exit
+    if args.max_steps == 0 and args.compute_fid:
+        print("\n" + "="*70)
+        print("⚠️  max_steps=0 detected with compute_fid=True")
+        print("   Skipping training, only computing FID...")
+        print("="*70 + "\n")
+        
+        # Trigger FID computation at step 0
+        if inception_fn is not None:
+            fid_mode = getattr(args, 'fid_mode', 'in')
+            
+            if fid_mode == "per_class":
+                print(f"\nComputing per-class FID at step 0...")
+                fid_result = compute_fid_per_class(
+                    p_state, modules, cfg, val_dataset,
+                    args.fid_num_samples, rng, args.use_ddim, args.eta, inception_fn
+                )
+                if fid_result is not None and isinstance(fid_result, tuple):
+                    fid_score, class_info = fid_result
+                    print(f"\n✅ Final FID Score: {fid_score:.2f}")
+            
+            elif fid_mode in ["in", "out", "both"]:
+                splits_to_eval = []
+                if fid_mode in ["in", "both"]:
+                    splits_to_eval.append("train")
+                if fid_mode in ["out", "both"]:
+                    splits_to_eval.append("test")
+                
+                for split in splits_to_eval:
+                    dist_name = "IN" if split == "train" else "OUT"
+                    print(f"\nComputing {dist_name}-distribution FID at step 0...")
+                    
+                    fid_result = compute_fid_mixture(
+                        p_state, modules, cfg, split,
+                        args.fid_num_samples, rng, args.use_ddim, args.eta, inception_fn, args
+                    )
+                    
+                    if fid_result is not None and isinstance(fid_result, tuple):
+                        fid_score, fid_info = fid_result
+                        print(f"\n✅ Final FID Score ({dist_name}): {fid_score:.2f}")
+        
+        print("\n" + "="*70)
+        print("FID evaluation complete. Exiting (no training).")
+        print("="*70 + "\n")
+        return
+    
     try:
         for epoch in range(10**6):  # effectively infinite unless steps reached
             pbar = tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch")
