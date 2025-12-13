@@ -326,8 +326,22 @@ def encode_set(
             if hc.ndim == 3:
                 hc = hc.mean(axis=1)
             # Extract patch tokens (skip CLS and TIME tokens)
-            # x_set_tokens: (b, np+2, dim) where first 2 are CLS and TIME
-            tokens = x_set_tokens[:, 2:, :]  # (b, np, dim) - patch tokens only
+            # ViT.forward_set always has TIME token (even if t_emb=None, it creates zero token)
+            # So offset is always 2: CLS + TIME
+            tokens = x_set_tokens[:, 2:, :]  # (b, np, dim) - patch tokens only (skip CLS=0, TIME=1)
+            
+            # ASSERT 1-4: Validate token shapes for ViT
+            b_actual = tokens.shape[0]
+            num_patches_actual = tokens.shape[1]
+            hdim_actual = tokens.shape[2]
+            num_patches_expected = (cfg.image_size // cfg.patch_size) ** 2
+            
+            assert tokens.ndim == 3, f"ViT tokens must be 3D, got {tokens.ndim}D"
+            assert hdim_actual == cfg.hdim, \
+                f"ViT tokens dim mismatch: got {hdim_actual}, expected {cfg.hdim}"
+            assert num_patches_actual == num_patches_expected, \
+                f"ViT num_patches mismatch: got {num_patches_actual}, expected {num_patches_expected}"
+            
             return hc, tokens
         else:
             # Use forward_set but don't return tokens
@@ -348,9 +362,33 @@ def encode_set(
         
         # Extract patch tokens for lag mode (skip CLS and TIME tokens)
         if return_tokens and cfg.mode_conditioning == "lag":
+            # sViT.forward_set always has TIME token (even if t_emb=None, it creates zero token)
+            # So offset is always 2: CLS=0, TIME=1, then patches start at idx=2
             # x_set_tokens: (b, np+2, dim) where first 2 are CLS and TIME
             # Extract only patch tokens: (b, np, dim)
             tokens = x_set_tokens[:, 2:, :]  # Skip CLS (idx 0) and TIME (idx 1)
+            
+            # ASSERT 1-4: Validate token shapes
+            b_actual = tokens.shape[0]
+            num_patches_actual = tokens.shape[1]
+            hdim_actual = tokens.shape[2]
+            num_patches_expected = (cfg.image_size // cfg.patch_size) ** 2
+            
+            assert tokens.ndim == 3, f"tokens must be 3D, got {tokens.ndim}D"
+            assert hdim_actual == cfg.hdim, \
+                f"tokens dim mismatch: got {hdim_actual}, expected {cfg.hdim}"
+            assert num_patches_actual == num_patches_expected, \
+                f"num_patches mismatch: got {num_patches_actual}, expected {num_patches_expected} (image_size={cfg.image_size}, patch_size={cfg.patch_size})"
+            
+            # Log for debugging
+            if not hasattr(encode_set, "_logged_tokens"):
+                import sys
+                print(f"\n[DEBUG encode_set] Token extraction (lag mode):", file=sys.stderr)
+                print(f"  - x_set_tokens shape: {x_set_tokens.shape}", file=sys.stderr)
+                print(f"  - tokens shape: {tokens.shape}", file=sys.stderr)
+                print(f"  - Expected num_patches: {num_patches_expected}", file=sys.stderr)
+                encode_set._logged_tokens = True
+            
             return hc, tokens
         
         return hc
@@ -430,11 +468,30 @@ def leave_one_out_c(
     for i in range(ns):
         idx = [k for k in range(ns) if k != i]
         x_subset = batch_set[:, idx]  # (b, ns-1, C, H, W)
-        # Expand t_emb for this subset: (b, hdim) -> (b * (ns-1), hdim)
-        subset_ns = ns - 1
-        t_emb_subset = jnp.repeat(t_emb_set[:, None, :], subset_ns, axis=1).reshape(
-            b * subset_ns, cfg.hdim
+        
+        # CRITICAL FIX: For sViT with SPT stacking, pad subset back to sample_size
+        # SPT expects fixed sample_size for patch_dim calculation
+        subset_ns_original = ns - 1
+        if cfg.encoder_mode == "vit_set" and x_subset.shape[1] < cfg.sample_size:
+            # Pad with zeros to maintain sample_size
+            pad_size = cfg.sample_size - x_subset.shape[1]
+            pad_images = jnp.zeros((b, pad_size, *x_subset.shape[2:]), dtype=x_subset.dtype)
+            x_subset = jnp.concatenate([x_subset, pad_images], axis=1)  # (b, sample_size, C, H, W)
+            subset_ns = cfg.sample_size
+        else:
+            subset_ns = subset_ns_original
+        
+        # Expand t_emb for this subset: (b, hdim) -> (b * subset_ns, hdim)
+        # If we padded, repeat the last t_emb for padded images
+        t_emb_subset = jnp.repeat(t_emb_set[:, None, :], subset_ns_original, axis=1).reshape(
+            b * subset_ns_original, cfg.hdim
         )
+        if subset_ns > subset_ns_original:
+            # Pad t_emb to match padded x_subset
+            pad_t_emb = jnp.repeat(t_emb_set[:, None, :], subset_ns - subset_ns_original, axis=1).reshape(
+                b * (subset_ns - subset_ns_original), cfg.hdim
+            )
+            t_emb_subset = jnp.concatenate([t_emb_subset, pad_t_emb], axis=0)  # (b * subset_ns, hdim)
         
         if need_tokens:
             # Get both hc and tokens for lag mode
@@ -451,9 +508,10 @@ def leave_one_out_c(
                 t_emb=t_emb_subset, return_tokens=False
             )
         
-        # Apply posterior if variational (works on pooled hc)
+        # Apply posterior if variational (works on pooled hc ONLY, not tokens)
+        # CRITICAL: c_vec is only for KL loss, NOT used for conditioning in lag mode
         c_vec, klc = sample_context(rngs[i], hc, cfg, posterior, params_post)
-        c_list.append(c_vec[:, None, ...])  # keep set slot: (b, 1, hdim)
+        c_list.append(c_vec[:, None, ...])  # keep set slot: (b, 1, hdim) - only for logging/debug
         if klc is not None:
             kl_list.append(klc)
 
@@ -464,8 +522,17 @@ def leave_one_out_c(
         token_set = jnp.stack(token_list, axis=1)  # (b, ns, num_patches, hdim)
         num_patches = token_set.shape[2]
         
+        # ASSERT 5: Validate final conditioning shape
+        assert token_set.shape[0] == b, f"token_set batch mismatch: got {token_set.shape[0]}, expected {b}"
+        assert token_set.shape[1] == ns, f"token_set ns mismatch: got {token_set.shape[1]}, expected {ns}"
+        assert token_set.shape[3] == cfg.hdim, f"token_set hdim mismatch: got {token_set.shape[3]}, expected {cfg.hdim}"
+        
         # Reshape to (b*ns, num_patches, hdim) for DiT cross-attention
         c = token_set.reshape(b * ns, num_patches, cfg.hdim)
+        
+        # ASSERT 6: Final conditioning shape
+        assert c.shape == (b * ns, num_patches, cfg.hdim), \
+            f"Final c shape mismatch: got {c.shape}, expected ({b*ns}, {num_patches}, {cfg.hdim})"
         
         # DEBUG: Log token shapes
         if not hasattr(leave_one_out_c, "_logged_tokens"):
@@ -474,6 +541,7 @@ def leave_one_out_c(
             print(f"  - token_set shape: {token_set.shape}", file=sys.stderr)
             print(f"  - c (final) shape: {c.shape}", file=sys.stderr)
             print(f"  - num_patches: {num_patches}", file=sys.stderr)
+            print(f"  - Expected: (b*ns={b*ns}, num_patches={num_patches}, hdim={cfg.hdim})", file=sys.stderr)
             leave_one_out_c._logged_tokens = True
     else:
         # For film mode: use pooled vectors
@@ -515,6 +583,11 @@ def vfsddpm_loss(
     x = batch_set.reshape(b * ns, *batch_set.shape[2:])
 
     def model_fn(x_in, t_in, _c_unused, **kwargs):
+        # ASSERT 6 (continued): Verify x and c have matching batch dimension
+        if cfg.mode_conditioning == "lag":
+            assert x_in.shape[0] == c.shape[0], \
+                f"Batch mismatch: x_in.shape[0]={x_in.shape[0]}, c.shape[0]={c.shape[0]}"
+            assert c.ndim == 3, f"Lag mode c must be 3D (b*ns, num_patches, hdim), got {c.ndim}D with shape {c.shape}"
         return dit.apply(params["dit"], x_in, t_in, c=c, train=train, **kwargs)
 
     losses = diffusion.training_losses(
