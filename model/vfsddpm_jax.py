@@ -602,7 +602,7 @@ def vfsddpm_loss(
     t_rep = jnp.repeat(t, ns, axis=0)
 
     # conditioning
-    rng_c, rng_loss = jax.random.split(noise_key)
+    rng_c, rng_loss, rng_dit_dropout = jax.random.split(noise_key, 3)
     c, klc = leave_one_out_c(rng_c, params, modules,
                              batch_set, cfg, train=train, t=t)
 
@@ -615,7 +615,11 @@ def vfsddpm_loss(
             assert x_in.shape[0] == c.shape[0], \
                 f"Batch mismatch: x_in.shape[0]={x_in.shape[0]}, c.shape[0]={c.shape[0]}"
             assert c.ndim == 3, f"Lag mode c must be 3D (b*ns, num_patches, hdim), got {c.ndim}D with shape {c.shape}"
-        return dit.apply(params["dit"], x_in, t_in, c=c, train=train, **kwargs)
+        # Pass rngs for dropout - Flax nn.Dropout needs PRNG key even when deterministic=True
+        apply_kwargs = {"train": train}
+        if train:
+            apply_kwargs["rngs"] = {"dropout": rng_dit_dropout}
+        return dit.apply(params["dit"], x_in, t_in, c=c, **apply_kwargs, **kwargs)
 
     losses = diffusion.training_losses(
         rng_loss, model_fn, x, t_rep, c=None, model_kwargs={}
