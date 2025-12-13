@@ -290,6 +290,7 @@ def encode_set(
     train: bool,
     t_emb: Optional[Array] = None,
     return_tokens: bool = False,
+    rng: Optional[PRNGKey] = None,
 ) -> Union[Array, Tuple[Array, Array]]:
     """
     Encode a set (or single image) into a set-level representation hc.
@@ -328,9 +329,15 @@ def encode_set(
         
         # Use forward_set to get tokens if needed
         if return_tokens and cfg.mode_conditioning == "lag":
+            # Pass rngs for dropout if train=True and dropout > 0
+            apply_kwargs = {
+                "train": train,
+                "method": encoder.forward_set
+            }
+            if train and cfg.dropout > 0 and rng is not None:
+                apply_kwargs["rngs"] = {"dropout": rng}
             hc, x_set_tokens, cls = encoder.apply(
-                params_enc, x_set, t_emb=t_emb_vit, c_old=None, 
-                train=train, method=encoder.forward_set
+                params_enc, x_set, t_emb=t_emb_vit, c_old=None, **apply_kwargs
             )
             if hc.ndim == 3:
                 hc = hc.mean(axis=1)
@@ -354,9 +361,14 @@ def encode_set(
             return hc, tokens
         else:
             # Use forward_set but don't return tokens
+            apply_kwargs = {
+                "train": train,
+                "method": encoder.forward_set
+            }
+            if train and cfg.dropout > 0 and rng is not None:
+                apply_kwargs["rngs"] = {"dropout": rng}
             hc, _, _ = encoder.apply(
-                params_enc, x_set, t_emb=t_emb_vit, c_old=None,
-                train=train, method=encoder.forward_set
+                params_enc, x_set, t_emb=t_emb_vit, c_old=None, **apply_kwargs
             )
             if hc.ndim == 3:
                 hc = hc.mean(axis=1)
@@ -364,8 +376,14 @@ def encode_set(
     else:
         # encoder returns (hc, patches, cls) for forward_set
         # Must explicitly call forward_set method (apply() defaults to __call__)
+        apply_kwargs = {
+            "train": train,
+            "method": encoder.forward_set
+        }
+        if train and cfg.dropout > 0 and rng is not None:
+            apply_kwargs["rngs"] = {"dropout": rng}
         hc, x_set_tokens, cls = encoder.apply(
-            params_enc, x_set, t_emb=t_emb, train=train, method=encoder.forward_set)
+            params_enc, x_set, t_emb=t_emb, **apply_kwargs)
         if hc.ndim == 3:
             hc = hc.mean(axis=1)
         
@@ -506,7 +524,7 @@ def leave_one_out_c(
             # Get both hc and tokens for lag mode
             hc, tokens = encode_set(
                 params["encoder"], enc, x_subset, cfg, train=train, 
-                t_emb=t_emb_subset, return_tokens=True
+                t_emb=t_emb_subset, return_tokens=True, rng=rngs[i]
             )
             # tokens: (b, num_patches, hdim)
             token_list.append(tokens)  # Will reshape later
@@ -514,7 +532,7 @@ def leave_one_out_c(
             # Only get hc for film mode
             hc = encode_set(
                 params["encoder"], enc, x_subset, cfg, train=train, 
-                t_emb=t_emb_subset, return_tokens=False
+                t_emb=t_emb_subset, return_tokens=False, rng=rngs[i]
             )
         
         # Apply posterior if variational (works on pooled hc ONLY, not tokens)

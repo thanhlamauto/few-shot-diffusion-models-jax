@@ -942,6 +942,9 @@ def main():
     logger.log(f"{'='*70}\n")
     
     logger.log("starting training (jax pmap)...")
+    logger.log("⚠️  First step will trigger JIT compilation (may take 2-10 minutes)...")
+    logger.log("   This is normal - JAX is compiling the training step for optimal performance.")
+    logger.log("   Please wait - you'll see progress after compilation completes.\n")
     global_step = 0
     
     # Special case: If max_steps is 0 and compute_fid is True, only evaluate FID and exit
@@ -1004,7 +1007,16 @@ def main():
                 rng, step_rng = jax.random.split(rng)
                 step_rngs = jax.random.split(step_rng, n_devices)
 
+                # First step triggers JIT compilation - this can take several minutes
+                if global_step == 0:
+                    logger.log("🔄 Compiling training step (first time only)...")
+                    logger.log("   This may take 2-10 minutes depending on model complexity.")
+                    logger.log("   CPU/GPU usage should be high during compilation.\n")
+                
                 p_state, metrics = p_train_step(p_state, batch_sharded, step_rngs)
+                
+                if global_step == 0:
+                    logger.log("✅ Compilation complete! Training starting...\n")
 
                 # host metrics
                 metrics_host = jax.tree.map(lambda x: np.array(x).mean(), metrics)

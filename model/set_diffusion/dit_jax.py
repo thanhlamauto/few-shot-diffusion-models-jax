@@ -132,7 +132,7 @@ class MlpBlock(nn.Module):
     mlp_dim: int
     dtype: Dtype = jnp.float32
     out_dim: Optional[int] = None
-    dropout_rate: float = None
+    dropout_rate: float = 0.0
     kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = (
         nn.initializers.xavier_uniform()
     )
@@ -141,7 +141,7 @@ class MlpBlock(nn.Module):
     )
 
     @nn.compact
-    def __call__(self, inputs):
+    def __call__(self, inputs, train: bool = True):
         actual_out_dim = inputs.shape[-1] if self.out_dim is None else self.out_dim
         x = nn.Dense(
             features=self.mlp_dim,
@@ -150,6 +150,9 @@ class MlpBlock(nn.Module):
             bias_init=self.bias_init,
         )(inputs)
         x = nn.gelu(x)
+        # Apply dropout after GELU activation
+        if self.dropout_rate > 0:
+            x = nn.Dropout(self.dropout_rate)(x, deterministic=not train)
         output = nn.Dense(
             features=actual_out_dim,
             dtype=self.dtype,
@@ -199,9 +202,10 @@ class DiTBlock(nn.Module):
     mlp_ratio: float = 4.0
     context_channels: int = 0
     mode_conditioning: str = "film"  # "film" or "lag"
+    dropout_rate: float = 0.0
 
     @nn.compact
-    def __call__(self, x, c, context=None):
+    def __call__(self, x, c, context=None, train: bool = False):
         # adaLN modulation params
         c_mod = nn.silu(c)
         c_mod = nn.Dense(
@@ -222,7 +226,11 @@ class DiTBlock(nn.Module):
         attn_x = nn.MultiHeadDotProductAttention(
             kernel_init=nn.initializers.xavier_uniform(), num_heads=self.num_heads
         )(x_modulated, x_modulated)
-        x = x + (gate_msa[:, None] * attn_x)
+        attn_x = gate_msa[:, None] * attn_x
+        # Apply dropout to self-attention output
+        if self.dropout_rate > 0:
+            attn_x = nn.Dropout(self.dropout_rate)(attn_x, deterministic=not train)
+        x = x + attn_x
 
         # Cross-attention for lag
         if self.mode_conditioning == "lag" and context is not None:
@@ -233,13 +241,18 @@ class DiTBlock(nn.Module):
             cross_attn_x = nn.MultiHeadDotProductAttention(
                 kernel_init=nn.initializers.xavier_uniform(), num_heads=self.num_heads
             )(x_norm_cross, context_proj, context_proj)
+            # Apply dropout to cross-attention output
+            if self.dropout_rate > 0:
+                cross_attn_x = nn.Dropout(self.dropout_rate)(cross_attn_x, deterministic=not train)
             x = x + cross_attn_x
 
         # MLP
         x_norm2 = nn.LayerNorm(use_bias=False, use_scale=False)(x)
         x_modulated2 = modulate(x_norm2, shift_mlp, scale_mlp)
-        mlp_x = MlpBlock(mlp_dim=int(self.hidden_size *
-                         self.mlp_ratio))(x_modulated2)
+        mlp_x = MlpBlock(
+            mlp_dim=int(self.hidden_size * self.mlp_ratio),
+            dropout_rate=self.dropout_rate
+        )(x_modulated2, train=train)
         x = x + (gate_mlp[:, None] * mlp_x)
         return x
 
@@ -284,6 +297,7 @@ class DiT(nn.Module):
     learn_sigma: bool = False
     context_channels: int = 0
     mode_conditioning: str = "film"  # "film" or "lag"
+    dropout_rate: float = 0.0
 
     @nn.compact
     def __call__(self, x, t, c=None, y=None, train=False, force_drop_ids=None):
@@ -346,7 +360,8 @@ class DiT(nn.Module):
                     self.mlp_ratio,
                     self.context_channels,
                     self.mode_conditioning,
-                )(x, conditioning, context=c)
+                    dropout_rate=self.dropout_rate,
+                )(x, conditioning, context=c, train=train)
             else:
                 x = DiTBlock(
                     self.hidden_size,
@@ -354,7 +369,8 @@ class DiT(nn.Module):
                     self.mlp_ratio,
                     self.context_channels,
                     self.mode_conditioning,
-                )(x, conditioning)
+                    dropout_rate=self.dropout_rate,
+                )(x, conditioning, train=train)
 
         x = FinalLayer(
             self.patch_size,

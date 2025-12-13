@@ -216,6 +216,7 @@ def create_dit_model(
         learn_sigma=learn_sigma,
         context_channels=context_channels,
         mode_conditioning=mode_conditioning,
+        dropout_rate=dropout,
     )
 
 
