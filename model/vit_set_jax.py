@@ -346,19 +346,19 @@ class sViT(nn.Module):
         if t_emb is None:
             t_tok = jnp.zeros((b, 1, dim), dtype=patches.dtype)
             # DEBUG: Log if no timestep
-            if not hasattr(forward_set, "_logged_no_t"):
+            if not hasattr(sViT.forward_set, "_logged_no_t"):
                 import sys
                 print(f"\n[DEBUG sViT.forward_set] ⚠️  t_emb=None, using zero time token", file=sys.stderr)
-                forward_set._logged_no_t = True
+                sViT.forward_set._logged_no_t = True
         else:
             # DEBUG: Log timestep usage (only first call)
-            if not hasattr(forward_set, "_logged_with_t"):
+            if not hasattr(sViT.forward_set, "_logged_with_t"):
                 import sys
                 print(f"\n[DEBUG sViT.forward_set] ✓ Received t_emb:", file=sys.stderr)
                 print(f"  - t_emb shape: {t_emb.shape}", file=sys.stderr)
                 print(f"  - dropout: {self.dropout}, emb_dropout: {self.emb_dropout}", file=sys.stderr)
                 print(f"  - train mode: {train}", file=sys.stderr)
-                forward_set._logged_with_t = True
+                sViT.forward_set._logged_with_t = True
             
             # safety check
             assert t_emb.shape[0] == b * ns, f"t_emb must be (b*ns, t_dim), got {t_emb.shape}"
