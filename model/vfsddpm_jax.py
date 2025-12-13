@@ -216,15 +216,31 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
 
     rng, rng_enc, rng_dit = jax.random.split(rng, 3)
 
-    # encoder params
+    # encoder params - MUST use forward_set to init to_time_embedding layer
     dummy_set = jnp.zeros(
         (1, cfg.sample_size, cfg.in_channels, cfg.image_size, cfg.image_size),
         dtype=jnp.float32,
     )
+    dummy_t_emb = jnp.zeros((1 * cfg.sample_size, cfg.hdim), dtype=jnp.float32)
+    
     if cfg.encoder_mode == "vit":
-        enc_params = enc.init(rng_enc, dummy_set[:, 0], train=False)
+        # ViT also uses forward_set with time embedding
+        enc_params = enc.init(
+            rng_enc,
+            dummy_set[:, 0],  # single image for ViT
+            t_emb=dummy_t_emb[:1],  # (1, hdim)
+            train=False,
+            method=enc.forward_set
+        )
     else:
-        enc_params = enc.init(rng_enc, dummy_set, train=False)
+        # sViT uses forward_set with full set
+        enc_params = enc.init(
+            rng_enc, 
+            dummy_set, 
+            t_emb=dummy_t_emb,  # (b*ns, hdim)
+            train=False, 
+            method=enc.forward_set
+        )
 
     # DiT params
     dummy_x = jnp.zeros(
