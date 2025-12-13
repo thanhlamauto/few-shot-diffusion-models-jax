@@ -31,6 +31,43 @@ Array = jnp.ndarray
 PRNGKey = jax.Array
 
 
+def timestep_embedding_jax(timesteps: Array, dim: int, max_period: int = 10000) -> Array:
+    """
+    Sin/cos timestep embedding (guided-diffusion style).
+    
+    Args:
+        timesteps: (b,) integer timesteps
+        dim: embedding dimension
+        max_period: maximum period for sinusoidal embedding
+        
+    Returns:
+        (b, dim) timestep embeddings
+    """
+    half = dim // 2
+    freqs = jnp.exp(-jnp.log(max_period) * jnp.arange(half, dtype=jnp.float32) / half)
+    args = timesteps.astype(jnp.float32)[:, None] * freqs[None, :]
+    emb = jnp.concatenate([jnp.cos(args), jnp.sin(args)], axis=-1)
+    if dim % 2 == 1:
+        emb = jnp.pad(emb, ((0, 0), (0, 1)))
+    return emb
+
+
+class TimeEmbed(nn.Module):
+    """
+    MLP giống UNet.time_embed: Linear -> SiLU -> Linear.
+    Input dim = base_dim, output dim = out_dim.
+    """
+    base_dim: int
+    out_dim: int
+
+    @nn.compact
+    def __call__(self, x: Array) -> Array:
+        x = nn.Dense(self.out_dim)(x)
+        x = nn.silu(x)
+        x = nn.Dense(self.out_dim)(x)
+        return x
+
+
 @dataclasses.dataclass
 class VFSDDPMConfig:
     # data
@@ -41,6 +78,13 @@ class VFSDDPMConfig:
     encoder_mode: str = "vit_set"  # "vit" or "vit_set"
     hdim: int = 256
     pool: str = "cls"
+    dropout: float = 0.0  # dropout for encoder and denoiser (applied uniformly)
+    # encoder architecture (configurable from CLI)
+    encoder_depth: int = 3
+    encoder_heads: int = 8
+    encoder_dim_head: int = 56
+    encoder_mlp_ratio: float = 1.0  # mlp_dim = int(hdim * encoder_mlp_ratio)
+    encoder_tokenize_mode: str = "stack"  # for sViT: "stack" | "per_sample_mean"
     # DiT
     hidden_size: int = 768
     depth: int = 12
@@ -64,31 +108,40 @@ class VFSDDPMConfig:
 
 
 def build_encoder(cfg: VFSDDPMConfig) -> nn.Module:
+    mlp_dim = int(cfg.hdim * cfg.encoder_mlp_ratio)
     if cfg.encoder_mode == "vit":
         return ViT(
             image_size=(cfg.image_size, cfg.image_size),
             patch_size=(cfg.patch_size, cfg.patch_size),
             num_classes=cfg.hdim,
             dim=cfg.hdim,
-            depth=6,
-            heads=12,
-            mlp_dim=cfg.hdim,
-            pool="cls",
+            depth=cfg.encoder_depth,
+            heads=cfg.encoder_heads,
+            dim_head=cfg.encoder_dim_head,
+            mlp_dim=mlp_dim,
+            pool=cfg.pool,
             channels=cfg.in_channels,
             ns=1,
+            dropout=cfg.dropout,
+            emb_dropout=cfg.dropout,
         )
     return sViT(
         image_size=(cfg.image_size, cfg.image_size),
         patch_size=cfg.patch_size,
         num_classes=cfg.hdim,
         dim=cfg.hdim,
-        depth=3,
-        heads=8,
-        dim_head=56,
-        mlp_dim=cfg.hdim,
+        depth=cfg.encoder_depth,
+        heads=cfg.encoder_heads,
+        dim_head=cfg.encoder_dim_head,
+        mlp_dim=mlp_dim,
         pool=cfg.pool,
         channels=cfg.in_channels,
         ns=cfg.sample_size,
+        t_dim=cfg.hdim,  # khớp với t_emb dim
+        sample_size=cfg.sample_size,
+        dropout=cfg.dropout,
+        emb_dropout=cfg.dropout,
+        tokenize_mode=cfg.encoder_tokenize_mode,
     )
 
 
@@ -140,7 +193,7 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
         num_heads=cfg.num_heads,
         mlp_ratio=cfg.mlp_ratio,
         patch_size=cfg.patch_size,
-        dropout=0.0,
+        dropout=cfg.dropout,
         diffusion_steps=cfg.diffusion_steps,
         noise_schedule=cfg.noise_schedule,
         timestep_respacing=cfg.timestep_respacing,
@@ -184,6 +237,15 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
     params = {"encoder": enc_params, "dit": dit_params}
     modules = {"encoder": enc, "dit": dit, "diffusion": diffusion}
 
+    # --- time_embed for encoder (mimic PyTorch generative_model.time_embed) ---
+    base_dim = cfg.hdim // 4  # giống model_channels=64 nếu hdim=256
+    time_embed = TimeEmbed(base_dim=base_dim, out_dim=cfg.hdim)
+    rng, rng_te = jax.random.split(rng)
+    dummy_te_in = jnp.zeros((1, base_dim), dtype=jnp.float32)
+    time_embed_params = time_embed.init(rng_te, dummy_te_in)
+    params["time_embed"] = time_embed_params
+    modules["time_embed"] = time_embed
+
     if cfg.mode_context == "variational":
         posterior = PosteriorGaussian(cfg.hdim)
         rng_post = jax.random.split(rng, 1)[0]
@@ -201,10 +263,25 @@ def encode_set(
     x_set: Array,
     cfg: VFSDDPMConfig,
     train: bool,
+    t_emb: Optional[Array] = None,
 ) -> Array:
     """
     Encode a set (or single image) into a set-level representation hc.
+    
+    Args:
+        t_emb: Optional timestep embedding (b*ns, t_dim)
+               If provided, encoder becomes time-aware
     """
+    # DEBUG: Log encode_set call (only first call)
+    if not hasattr(encode_set, "_logged"):
+        import sys
+        print(f"\n[DEBUG encode_set] Called with:", file=sys.stderr)
+        print(f"  - x_set shape: {x_set.shape}", file=sys.stderr)
+        print(f"  - t_emb: {'None' if t_emb is None else f'shape={t_emb.shape}'}", file=sys.stderr)
+        print(f"  - train: {train}", file=sys.stderr)
+        print(f"  - encoder_mode: {cfg.encoder_mode}", file=sys.stderr)
+        encode_set._logged = True
+    
     if cfg.encoder_mode == "vit":
         # flatten and average
         b, ns = x_set.shape[:2]
@@ -216,7 +293,7 @@ def encode_set(
         # encoder returns (hc, patches, cls) for forward_set
         # Must explicitly call forward_set method (apply() defaults to __call__)
         hc, _, _ = encoder.apply(
-            params_enc, x_set, train=train, method=encoder.forward_set)
+            params_enc, x_set, t_emb=t_emb, train=train, method=encoder.forward_set)
         if hc.ndim == 3:
             hc = hc.mean(axis=1)
     return hc
@@ -255,6 +332,7 @@ def leave_one_out_c(
     batch_set: Array,
     cfg: VFSDDPMConfig,
     train: bool,
+    t: Array,  # (b,) integer timesteps
 ) -> Tuple[Array, Optional[Array]]:
     """
     Build conditioning c for each element via leave-one-out over the set.
@@ -268,13 +346,35 @@ def leave_one_out_c(
     posterior = modules.get("posterior")
     params_post = params.get("posterior")
 
+    # --- make t_emb like PyTorch: time_embed(timestep_embedding(t)) ---
+    base_dim = cfg.hdim // 4
+    t_base = timestep_embedding_jax(t, base_dim)  # (b, base_dim)
+    t_emb_set = modules["time_embed"].apply(params["time_embed"], t_base)  # (b, hdim)
+    
+    # DEBUG: Log timestep embedding info (only first call)
+    if not hasattr(leave_one_out_c, "_logged"):
+        import sys
+        print(f"\n[DEBUG leave_one_out_c] Timestep embedding for encoder:", file=sys.stderr)
+        print(f"  - t shape: {t.shape}, values: {t[:min(3, len(t))]}", file=sys.stderr)
+        print(f"  - t_emb_set shape: {t_emb_set.shape}", file=sys.stderr)
+        print(f"  - Encoder mode: {cfg.encoder_mode}", file=sys.stderr)
+        print(f"  - Dropout: {cfg.dropout}", file=sys.stderr)
+        leave_one_out_c._logged = True
+
     kl_list = []
     c_list = []
     rngs = jax.random.split(rng, ns)
     for i in range(ns):
         idx = [k for k in range(ns) if k != i]
         x_subset = batch_set[:, idx]  # (b, ns-1, C, H, W)
-        hc = encode_set(params["encoder"], enc, x_subset, cfg, train=train)
+        # Expand t_emb for this subset: (b, hdim) -> (b * (ns-1), hdim)
+        subset_ns = ns - 1
+        t_emb_subset = jnp.repeat(t_emb_set[:, None, :], subset_ns, axis=1).reshape(
+            b * subset_ns, cfg.hdim
+        )
+        hc = encode_set(
+            params["encoder"], enc, x_subset, cfg, train=train, t_emb=t_emb_subset
+        )
         c_vec, klc = sample_context(rngs[i], hc, cfg, posterior, params_post)
         c_list.append(c_vec[:, None, ...])  # keep set slot
         if klc is not None:
@@ -317,7 +417,7 @@ def vfsddpm_loss(
     # conditioning
     rng_c, rng_loss = jax.random.split(noise_key)
     c, klc = leave_one_out_c(rng_c, params, modules,
-                             batch_set, cfg, train=train)
+                             batch_set, cfg, train=train, t=t)
 
     # flatten images
     x = batch_set.reshape(b * ns, *batch_set.shape[2:])

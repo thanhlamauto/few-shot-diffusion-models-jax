@@ -457,6 +457,59 @@ def main():
 
     params, modules, cfg = select_model_jax(args, rng_model)
 
+    # -----------------------------
+    # DEBUG: show what was passed into model init
+    # -----------------------------
+    import sys
+    cfg_dict = dataclasses.asdict(cfg)
+    cfg_keys_used_from_cli = [
+        # encoder / conditioning
+        "encoder_mode",
+        "hdim",
+        "pool",
+        "sample_size",
+        "image_size",
+        "in_channels",
+        "patch_size",
+        "dropout",
+        "encoder_depth",
+        "encoder_heads",
+        "encoder_dim_head",
+        "encoder_mlp_ratio",
+        "encoder_tokenize_mode",
+        "mode_conditioning",
+        "mode_context",
+        # DiT
+        "hidden_size",
+        "depth",
+        "num_heads",
+        "mlp_ratio",
+        "context_channels",
+        # diffusion
+        "diffusion_steps",
+        "noise_schedule",
+        "learn_sigma",
+        "timestep_respacing",
+        "use_kl",
+        "predict_xstart",
+        "rescale_timesteps",
+        "rescale_learned_sigmas",
+    ]
+
+    print("\n[DEBUG model_init] CLI args that feed VFSDDPMConfig:", file=sys.stderr)
+    for k in cfg_keys_used_from_cli:
+        if hasattr(args, k):
+            print(f"  - args.{k} = {getattr(args, k)}", file=sys.stderr)
+        else:
+            print(f"  - args.{k} = <missing>", file=sys.stderr)
+
+    print("\n[DEBUG model_init] Effective VFSDDPMConfig values:", file=sys.stderr)
+    for k in cfg_keys_used_from_cli:
+        if k in cfg_dict:
+            print(f"  - cfg.{k} = {cfg_dict[k]}", file=sys.stderr)
+        else:
+            print(f"  - cfg.{k} = <missing>", file=sys.stderr)
+
     # Count and log parameters
     def count_params(params_dict):
         """Count total parameters in nested dict."""
@@ -483,27 +536,24 @@ def main():
     logger.log(f"  Sample size (ns): {cfg.sample_size}")
     logger.log(f"  Pool mode: {cfg.pool}")
     
-    # Encoder architecture (hardcoded in build_encoder in vfsddpm_jax.py)
-    # ⚠️ If you want to change encoder depth/heads, edit build_encoder() function!
+    # Encoder architecture (configurable from CLI)
+    enc_depth = getattr(cfg, "encoder_depth", None)
+    enc_heads = getattr(cfg, "encoder_heads", None)
+    enc_dim_head = getattr(cfg, "encoder_dim_head", None)
+    enc_mlp_dim = int(cfg.hdim * getattr(cfg, "encoder_mlp_ratio", 1.0))
     if cfg.encoder_mode == "vit":
-        enc_depth = 6
-        enc_heads = 12
-        enc_mlp_dim = cfg.hdim
-        enc_dim_head = 64
-        logger.log(f"  Depth: {enc_depth} layers (standard ViT)")
+        logger.log(f"  Depth: {enc_depth} layers (ViT)")
     else:  # vit_set (sViT)
-        enc_depth = 6  # ⚠️ HARDCODED in vfsddpm_jax.py line 85
-        enc_heads = 12  # ⚠️ HARDCODED in vfsddpm_jax.py line 86
-        enc_mlp_dim = cfg.hdim
-        enc_dim_head = 64
         num_patches = (cfg.image_size // cfg.patch_size) ** 2
         logger.log(f"  Depth: {enc_depth} layers (sViT with LSA)")
         logger.log(f"  Num patches: {num_patches}")
-        logger.log(f"  ⚠️  Note: Encoder depth/heads are HARDCODED in vfsddpm_jax.py")
+        logger.log(f"  Tokenize mode: {getattr(cfg, 'encoder_tokenize_mode', 'stack')}")
     
     logger.log(f"  Attention heads: {enc_heads}")
     logger.log(f"  Dim per head: {enc_dim_head}")
     logger.log(f"  MLP dim: {enc_mlp_dim}")
+    logger.log(f"  Dropout: {cfg.dropout}")
+    logger.log(f"  Timestep conditioning: {'✓ Enabled' if cfg.encoder_mode == 'vit_set' else '✗ Not supported (use vit_set)'}")
     logger.log(f"  Parameters: {param_breakdown.get('encoder', 0):,} ({param_breakdown.get('encoder', 0)/1e6:.2f}M)")
     
     # Detailed encoder param breakdown
@@ -532,6 +582,7 @@ def main():
     logger.log(f"  Attention heads: {cfg.num_heads}")
     logger.log(f"  MLP ratio: {cfg.mlp_ratio}")
     logger.log(f"  Patch size: {cfg.patch_size}")
+    logger.log(f"  Dropout: {cfg.dropout}")
     logger.log(f"  Conditioning: {cfg.mode_conditioning}")
     logger.log(f"  Context channels: {cfg.context_channels}")
     logger.log(f"  Parameters: {param_breakdown.get('dit', 0):,} ({param_breakdown.get('dit', 0)/1e6:.2f}M)")
@@ -990,6 +1041,13 @@ def create_argparser():
         in_channels=3,
         encoder_mode="vit_set",
         pool="cls",
+        dropout=0.0,  # Dropout for encoder and denoiser (0.0 = no dropout)
+        # Encoder architecture (passed into build_encoder via VFSDDPMConfig)
+        encoder_depth=6,
+        encoder_heads=8,
+        encoder_dim_head=56,
+        encoder_mlp_ratio=1.0,
+        encoder_tokenize_mode="stack",  # "stack" | "per_sample_mean"
         context_channels=448,  # Match with hidden_size (must be divisible by 4)
         mode_context="deterministic",
         mode_conditioning="film",

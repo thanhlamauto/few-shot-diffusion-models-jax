@@ -1,0 +1,14 @@
+- cách 2 là đưa t là 1 tham số
+- 1 cách là làm cho bị nhiễu ở mức t
+
+- thêm dropout 0.2 cho cả 
+
+- Kích thước ViT encoder là 5M
+- Tính kích thước UNet
+- Tuỳ chỉnh layer DiT
+- Xoá t của DiT (xoá t trong AdaLN)
+- FiLM là thằng truyền time emb vào denoiser
+- variational FSDM cho kết quả tệ hơn
+- c là “hằng số theo timestep”
+
+- Hướng sửa số 2 là chỉnh AdaLN sang Cross-Attention
