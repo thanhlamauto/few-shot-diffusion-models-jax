@@ -535,7 +535,9 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
         rng, cond_rng = jax.random.split(rng)
         
         # Create dummy timestep for encoding (encoder needs t for time_embed)
-        t_dummy = jnp.zeros((1,), dtype=jnp.int32)
+        # t must have shape (b,) where b is batch size
+        bs = mini_batch.shape[0]
+        t_dummy = jnp.zeros((bs,), dtype=jnp.int32)
         c_cond, _ = leave_one_out_c(
             cond_rng, sub, modules, mini_batch, cfg, train=False, t=t_dummy)
         
@@ -789,6 +791,36 @@ def main():
     if 'posterior' in param_breakdown:
         logger.log(f"  Posterior: {param_breakdown['posterior']/1e6:.2f}M ({param_breakdown['posterior']/total_params*100:.1f}%)")
     logger.log(f"{'='*70}\n")
+    
+    # Log conditioning mode details
+    logger.log(f"\n{'='*70}")
+    logger.log(f"CONDITIONING CONFIGURATION:")
+    logger.log(f"{'='*70}")
+    logger.log(f"  Mode: {cfg.mode_conditioning.upper()}")
+    if cfg.mode_conditioning == "lag":
+        logger.log(f"  ✅ Using CROSS-ATTENTION with patch tokens")
+        num_patches = (cfg.image_size // cfg.patch_size) ** 2
+        logger.log(f"  Patch tokens per image: {num_patches}")
+        logger.log(f"  Conditioning shape: (b*ns, {num_patches}, {cfg.hdim})")
+        if cfg.context_channels != cfg.hdim:
+            logger.log(f"\n  ⚠️  WARNING: context_channels ({cfg.context_channels}) != hdim ({cfg.hdim})")
+            logger.log(f"     For lag mode, context_channels should match hdim!")
+            logger.log(f"     DiT will project tokens from {cfg.hdim} to {cfg.context_channels}")
+        else:
+            logger.log(f"  ✅ context_channels ({cfg.context_channels}) matches hdim ({cfg.hdim})")
+    else:
+        logger.log(f"  ✅ Using FiLM (adaLN-Zero) with pooled vectors")
+        logger.log(f"  Conditioning shape: (b*ns, {cfg.hdim})")
+    logger.log(f"{'='*70}\n")
+    
+    # Log freeze DiT setting
+    freeze_dit_steps = getattr(args, 'freeze_dit_steps', 0)
+    if freeze_dit_steps > 0:
+        logger.log(f"\n⚠️  FREEZE DiT MODE ENABLED:")
+        logger.log(f"   DiT will be FROZEN for first {freeze_dit_steps} steps")
+        logger.log(f"   Only encoder (+ time_embed + posterior if variational) will train")
+        logger.log(f"   DiT will unfreeze at step {freeze_dit_steps + 1}")
+        logger.log(f"{'='*70}\n")
 
     # Train state and optimizer
     state, tx = create_train_state_pmap(
@@ -801,8 +833,10 @@ def main():
     def loss_fn(p, batch, rng_in):
         return vfsddpm_loss(rng_in, p, modules, batch, cfg, train=True)
 
+    freeze_dit_steps = getattr(args, 'freeze_dit_steps', 0)
     p_train_step = train_step_pmap(
-        tx, loss_fn, ema_rate=float(str(args.ema_rate).split(",")[0]))
+        tx, loss_fn, ema_rate=float(str(args.ema_rate).split(",")[0]),
+        freeze_dit_steps=freeze_dit_steps)
 
     # Data loaders (PyTorch) on CPU
     train_loader = create_loader(args, split="train", shuffle=True)
@@ -863,6 +897,50 @@ def main():
 
     load_checkpoint(args.resume_checkpoint)
 
+    # Print full configuration for debugging
+    logger.log(f"\n{'='*70}")
+    logger.log(f"FULL CONFIGURATION (for debugging):")
+    logger.log(f"{'='*70}")
+    logger.log(f"Dataset: {args.dataset}")
+    logger.log(f"Image size: {cfg.image_size}")
+    logger.log(f"Sample size (ns): {cfg.sample_size}")
+    logger.log(f"Batch size: {args.batch_size}")
+    logger.log(f"")
+    logger.log(f"Encoder:")
+    logger.log(f"  Mode: {cfg.encoder_mode}")
+    logger.log(f"  Hidden dim (hdim): {cfg.hdim}")
+    logger.log(f"  Depth: {cfg.encoder_depth}")
+    logger.log(f"  Heads: {cfg.encoder_heads}")
+    logger.log(f"  Dim head: {cfg.encoder_dim_head}")
+    logger.log(f"  MLP ratio: {cfg.encoder_mlp_ratio}")
+    logger.log(f"  Tokenize mode: {cfg.encoder_tokenize_mode}")
+    logger.log(f"  Pool: {cfg.pool}")
+    logger.log(f"  Dropout: {cfg.dropout}")
+    logger.log(f"")
+    logger.log(f"DiT:")
+    logger.log(f"  Hidden size: {cfg.hidden_size}")
+    logger.log(f"  Depth: {cfg.depth}")
+    logger.log(f"  Heads: {cfg.num_heads}")
+    logger.log(f"  MLP ratio: {cfg.mlp_ratio}")
+    logger.log(f"  Patch size: {cfg.patch_size}")
+    logger.log(f"  Context channels: {cfg.context_channels}")
+    logger.log(f"  Mode conditioning: {cfg.mode_conditioning}")
+    logger.log(f"")
+    logger.log(f"Diffusion:")
+    logger.log(f"  Steps: {cfg.diffusion_steps}")
+    logger.log(f"  Noise schedule: {cfg.noise_schedule}")
+    logger.log(f"  Learn sigma: {cfg.learn_sigma}")
+    logger.log(f"")
+    logger.log(f"Context:")
+    logger.log(f"  Mode: {cfg.mode_context}")
+    logger.log(f"")
+    logger.log(f"Training:")
+    logger.log(f"  Learning rate: {args.lr}")
+    logger.log(f"  Weight decay: {args.weight_decay}")
+    logger.log(f"  Max steps: {args.max_steps if args.max_steps > 0 else 'infinite'}")
+    logger.log(f"  EMA rate: {args.ema_rate}")
+    logger.log(f"{'='*70}\n")
+    
     logger.log("starting training (jax pmap)...")
     global_step = 0
     
@@ -932,6 +1010,13 @@ def main():
                 metrics_host = jax.tree.map(lambda x: np.array(x).mean(), metrics)
                 global_step += 1
 
+                # Check if DiT is frozen
+                dit_frozen = freeze_dit_steps > 0 and global_step <= freeze_dit_steps
+                if dit_frozen:
+                    metrics_host["debug/dit_frozen"] = 1.0
+                else:
+                    metrics_host["debug/dit_frozen"] = 0.0
+
                 # Debug logging for first 10 iterations
                 if global_step <= 10:
                     logger.log(f"\n{'='*70}")
@@ -963,8 +1048,23 @@ def main():
                     'loss': f"{metrics_host.get('loss', 0):.4f}" if 'loss' in metrics_host else 'N/A'
                 })
 
+                # Special logging when DiT unfreezes
+                if freeze_dit_steps > 0 and global_step == freeze_dit_steps + 1:
+                    logger.log(f"\n{'='*70}")
+                    logger.log(f"🔓 DiT UNFROZEN at step {global_step}")
+                    logger.log(f"   Now training BOTH encoder and DiT")
+                    logger.log(f"{'='*70}\n")
+
                 if global_step % args.log_interval == 0:
                     logger.logkv("step", global_step)
+                    
+                    # Add freeze status to log
+                    if freeze_dit_steps > 0:
+                        if dit_frozen:
+                            logger.logkv("training_mode", f"FROZEN_DiT (step {global_step}/{freeze_dit_steps})")
+                        else:
+                            logger.logkv("training_mode", "FULL (encoder+DiT)")
+                    
                     for k, v in metrics_host.items():
                         if isinstance(v, np.ndarray):
                             v = v.item() if v.size == 1 else v
@@ -1256,6 +1356,7 @@ def create_argparser():
         weight_decay=0.0,
         lr_anneal_steps=0,
         max_steps=0,  # 0 means infinite, set to positive number to limit training
+        freeze_dit_steps=0,  # If > 0, freeze DiT for first N steps (only train encoder)
         batch_size=16,
         batch_size_eval=16,
         log_interval=100,

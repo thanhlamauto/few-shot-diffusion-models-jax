@@ -338,8 +338,13 @@ class sViT(nn.Module):
         """
         patches = self.to_patch_embedding(img)  # (b, np, dim)
         b, n, dim = patches.shape
-        ns = self.ns
-
+        
+        # Get actual ns from input shape, not self.ns (for leave-one-out compatibility)
+        if img.ndim == 5:
+            actual_ns = img.shape[1]  # (b, ns, c, h, w)
+        else:
+            actual_ns = self.ns  # fallback to config value
+        
         cls_tokens = jnp.repeat(self.cls_token, b, axis=0)  # (b,1,dim)
 
         # TIME token (giống paper)
@@ -356,14 +361,17 @@ class sViT(nn.Module):
                 import sys
                 print(f"\n[DEBUG sViT.forward_set] ✓ Received t_emb:", file=sys.stderr)
                 print(f"  - t_emb shape: {t_emb.shape}", file=sys.stderr)
+                print(f"  - img shape: {img.shape}, actual_ns: {actual_ns}", file=sys.stderr)
                 print(f"  - dropout: {self.dropout}, emb_dropout: {self.emb_dropout}", file=sys.stderr)
                 print(f"  - train mode: {train}", file=sys.stderr)
                 sViT.forward_set._logged_with_t = True
             
-            # safety check
-            assert t_emb.shape[0] == b * ns, f"t_emb must be (b*ns, t_dim), got {t_emb.shape}"
-            t_tok = self.to_time_embedding(t_emb)         # (b*ns, dim)
-            t_tok = t_tok.reshape(b, ns, -1)              # (b, ns, dim)
+            # safety check: t_emb should match actual number of images in batch
+            expected_t_emb_size = b * actual_ns
+            assert t_emb.shape[0] == expected_t_emb_size, \
+                f"t_emb must be (b*actual_ns, t_dim), got {t_emb.shape}, expected first dim={expected_t_emb_size} (b={b}, actual_ns={actual_ns})"
+            t_tok = self.to_time_embedding(t_emb)         # (b*actual_ns, dim)
+            t_tok = t_tok.reshape(b, actual_ns, -1)       # (b, actual_ns, dim)
             t_tok = t_tok[:, 0:1, :]                      # (b,1,dim) lấy phần tử đầu, y như paper
 
         # concat: [CLS | TIME | PATCHES]

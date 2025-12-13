@@ -11,7 +11,7 @@ in `model/set_diffusion/dit_jax.py` and diffusion in
 """
 
 import dataclasses
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 import flax.linen as nn
 import jax
@@ -280,15 +280,21 @@ def encode_set(
     cfg: VFSDDPMConfig,
     train: bool,
     t_emb: Optional[Array] = None,
-) -> Array:
+    return_tokens: bool = False,
+) -> Union[Array, Tuple[Array, Array]]:
     """
     Encode a set (or single image) into a set-level representation hc.
     
     Args:
         t_emb: Optional timestep embedding (b*ns, t_dim)
                If provided, encoder becomes time-aware
+        return_tokens: If True and mode_conditioning=="lag", also return patch tokens
+                      Returns (hc, tokens) tuple instead of just hc
+    Returns:
+        hc: (b, hdim) pooled representation
+        tokens: (b, num_patches, hdim) patch tokens (only if return_tokens=True and lag mode)
     """
-    # DEBUG: Log encode_set call (only first call)
+        # DEBUG: Log encode_set call (only first call)
     if not hasattr(encode_set, "_logged"):
         import sys
         print(f"\n[DEBUG encode_set] Called with:", file=sys.stderr)
@@ -296,23 +302,58 @@ def encode_set(
         print(f"  - t_emb: {'None' if t_emb is None else f'shape={t_emb.shape}'}", file=sys.stderr)
         print(f"  - train: {train}", file=sys.stderr)
         print(f"  - encoder_mode: {cfg.encoder_mode}", file=sys.stderr)
+        print(f"  - mode_conditioning: {cfg.mode_conditioning}", file=sys.stderr)
+        print(f"  - return_tokens: {return_tokens}", file=sys.stderr)
         encode_set._logged = True
     
     if cfg.encoder_mode == "vit":
-        # flatten and average
+        # ViT also has forward_set method similar to sViT
         b, ns = x_set.shape[:2]
-        x_flat = x_set.reshape(b * ns, *x_set.shape[2:])
-        # encoder returns just hc for __call__
-        hc_flat = encoder.apply(params_enc, x_flat, train=train)
-        hc = hc_flat.reshape(b, ns, -1).mean(axis=1)
+        # Expand t_emb for ViT: (b*ns, hdim) -> (b, hdim) by taking first per batch
+        if t_emb is not None:
+            # t_emb: (b*ns, hdim), reshape to (b, ns, hdim) and take first
+            t_emb_reshaped = t_emb.reshape(b, ns, -1)
+            t_emb_vit = t_emb_reshaped[:, 0, :]  # (b, hdim) - take first image's t_emb
+        else:
+            t_emb_vit = None
+        
+        # Use forward_set to get tokens if needed
+        if return_tokens and cfg.mode_conditioning == "lag":
+            hc, x_set_tokens, cls = encoder.apply(
+                params_enc, x_set, t_emb=t_emb_vit, c_old=None, 
+                train=train, method=encoder.forward_set
+            )
+            if hc.ndim == 3:
+                hc = hc.mean(axis=1)
+            # Extract patch tokens (skip CLS and TIME tokens)
+            # x_set_tokens: (b, np+2, dim) where first 2 are CLS and TIME
+            tokens = x_set_tokens[:, 2:, :]  # (b, np, dim) - patch tokens only
+            return hc, tokens
+        else:
+            # Use forward_set but don't return tokens
+            hc, _, _ = encoder.apply(
+                params_enc, x_set, t_emb=t_emb_vit, c_old=None,
+                train=train, method=encoder.forward_set
+            )
+            if hc.ndim == 3:
+                hc = hc.mean(axis=1)
+            return hc
     else:
         # encoder returns (hc, patches, cls) for forward_set
         # Must explicitly call forward_set method (apply() defaults to __call__)
-        hc, _, _ = encoder.apply(
+        hc, x_set_tokens, cls = encoder.apply(
             params_enc, x_set, t_emb=t_emb, train=train, method=encoder.forward_set)
         if hc.ndim == 3:
             hc = hc.mean(axis=1)
-    return hc
+        
+        # Extract patch tokens for lag mode (skip CLS and TIME tokens)
+        if return_tokens and cfg.mode_conditioning == "lag":
+            # x_set_tokens: (b, np+2, dim) where first 2 are CLS and TIME
+            # Extract only patch tokens: (b, np, dim)
+            tokens = x_set_tokens[:, 2:, :]  # Skip CLS (idx 0) and TIME (idx 1)
+            return hc, tokens
+        
+        return hc
 
 
 def sample_context(
@@ -354,8 +395,8 @@ def leave_one_out_c(
     Build conditioning c for each element via leave-one-out over the set.
     Returns (c, klc_optional).
     Shapes:
-        film -> c: (bs * ns, hdim)
-        lag  -> c: (bs * ns, tokens, hdim)  (tokens=1 here)
+        film -> c: (bs * ns, hdim) - pooled vector
+        lag  -> c: (bs * ns, num_patches, hdim) - patch tokens for cross-attention
     """
     b, ns = batch_set.shape[:2]
     enc = modules["encoder"]
@@ -367,19 +408,25 @@ def leave_one_out_c(
     t_base = timestep_embedding_jax(t, base_dim)  # (b, base_dim)
     t_emb_set = modules["time_embed"].apply(params["time_embed"], t_base)  # (b, hdim)
     
-    # DEBUG: Log timestep embedding info (only first call)
+        # DEBUG: Log timestep embedding info (only first call)
     if not hasattr(leave_one_out_c, "_logged"):
         import sys
         print(f"\n[DEBUG leave_one_out_c] Timestep embedding for encoder:", file=sys.stderr)
         print(f"  - t shape: {t.shape}, values: {t[:min(3, len(t))]}", file=sys.stderr)
         print(f"  - t_emb_set shape: {t_emb_set.shape}", file=sys.stderr)
         print(f"  - Encoder mode: {cfg.encoder_mode}", file=sys.stderr)
+        print(f"  - Mode conditioning: {cfg.mode_conditioning}", file=sys.stderr)
         print(f"  - Dropout: {cfg.dropout}", file=sys.stderr)
         leave_one_out_c._logged = True
 
     kl_list = []
     c_list = []
+    token_list = []  # For lag mode: collect patch tokens
     rngs = jax.random.split(rng, ns)
+    
+    # Check if we need tokens for lag mode
+    need_tokens = cfg.mode_conditioning == "lag"
+    
     for i in range(ns):
         idx = [k for k in range(ns) if k != i]
         x_subset = batch_set[:, idx]  # (b, ns-1, C, H, W)
@@ -388,21 +435,50 @@ def leave_one_out_c(
         t_emb_subset = jnp.repeat(t_emb_set[:, None, :], subset_ns, axis=1).reshape(
             b * subset_ns, cfg.hdim
         )
-        hc = encode_set(
-            params["encoder"], enc, x_subset, cfg, train=train, t_emb=t_emb_subset
-        )
+        
+        if need_tokens:
+            # Get both hc and tokens for lag mode
+            hc, tokens = encode_set(
+                params["encoder"], enc, x_subset, cfg, train=train, 
+                t_emb=t_emb_subset, return_tokens=True
+            )
+            # tokens: (b, num_patches, hdim)
+            token_list.append(tokens)  # Will reshape later
+        else:
+            # Only get hc for film mode
+            hc = encode_set(
+                params["encoder"], enc, x_subset, cfg, train=train, 
+                t_emb=t_emb_subset, return_tokens=False
+            )
+        
+        # Apply posterior if variational (works on pooled hc)
         c_vec, klc = sample_context(rngs[i], hc, cfg, posterior, params_post)
-        c_list.append(c_vec[:, None, ...])  # keep set slot
+        c_list.append(c_vec[:, None, ...])  # keep set slot: (b, 1, hdim)
         if klc is not None:
             kl_list.append(klc)
 
-    c_set = jnp.concatenate(c_list, axis=1)  # (b, ns, hdim)
-
-    if cfg.mode_conditioning == "lag":
-        # provide one token per element (can be extended)
-        c = c_set.reshape(b * ns, 1, c_set.shape[-1])
+    if need_tokens:
+        # For lag mode: use patch tokens for cross-attention
+        # token_list: list of (b, num_patches, hdim), length=ns
+        # Stack: (b, ns, num_patches, hdim)
+        token_set = jnp.stack(token_list, axis=1)  # (b, ns, num_patches, hdim)
+        num_patches = token_set.shape[2]
+        
+        # Reshape to (b*ns, num_patches, hdim) for DiT cross-attention
+        c = token_set.reshape(b * ns, num_patches, cfg.hdim)
+        
+        # DEBUG: Log token shapes
+        if not hasattr(leave_one_out_c, "_logged_tokens"):
+            import sys
+            print(f"\n[DEBUG leave_one_out_c] Using patch tokens for lag mode:", file=sys.stderr)
+            print(f"  - token_set shape: {token_set.shape}", file=sys.stderr)
+            print(f"  - c (final) shape: {c.shape}", file=sys.stderr)
+            print(f"  - num_patches: {num_patches}", file=sys.stderr)
+            leave_one_out_c._logged_tokens = True
     else:
-        c = c_set.reshape(b * ns, c_set.shape[-1])
+        # For film mode: use pooled vectors
+        c_set = jnp.concatenate(c_list, axis=1)  # (b, ns, hdim)
+        c = c_set.reshape(b * ns, c_set.shape[-1])  # (b*ns, hdim)
 
     klc_total = None
     if kl_list:

@@ -193,10 +193,14 @@ def train_step_pmap(
     tx: optax.GradientTransformation,
     loss_fn: Callable[[Any, Array, PRNGKey], Dict[str, Array]],
     ema_rate: float = 0.999,
+    freeze_dit_steps: int = 0,
 ):
     """
     Returns a pmapped train step: state, batch, rng -> (state, metrics).
     loss_fn(params, batch, rng) should return dict with key 'loss' and optionally 'context'.
+    
+    Args:
+        freeze_dit_steps: If > 0, freeze DiT parameters for the first N steps (only train encoder)
     """
 
     def step(state: TrainStatePmap, batch, rng):
@@ -205,6 +209,27 @@ def train_step_pmap(
             return losses["loss"], losses
 
         (loss, losses), grads = jax.value_and_grad(loss_wrap, has_aux=True)(state.params)
+        
+        # Freeze DiT for first N steps if enabled
+        if freeze_dit_steps > 0:
+            should_freeze_dit = state.step < freeze_dit_steps
+            
+            # Create masked gradients: zero out DiT grads if frozen
+            def mask_dit_grads(grad_dict):
+                if "dit" in grad_dict:
+                    # Zero out DiT gradients if frozen
+                    dit_grads_masked = jax.lax.cond(
+                        should_freeze_dit,
+                        lambda g: jax.tree.map(jnp.zeros_like, g),  # Freeze: zero grads
+                        lambda g: g,  # Normal: keep grads
+                        grad_dict["dit"]
+                    )
+                    grad_dict_masked = {**grad_dict, "dit": dit_grads_masked}
+                    return grad_dict_masked
+                return grad_dict
+            
+            grads = mask_dit_grads(grads)
+        
         updates, new_opt_state = tx.update(grads, state.opt_state, state.params)
         new_params = optax.apply_updates(state.params, updates)
         new_ema_params = _tree_update_ema(state.ema_params, new_params, rate=ema_rate)
