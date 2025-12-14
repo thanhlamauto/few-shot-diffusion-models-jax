@@ -25,7 +25,7 @@ import sys
 from dataset import create_loader, select_dataset
 from model import select_model  # keeps existing namespace for non-JAX
 from model.select_model_jax import select_model_jax
-from model.vfsddpm_jax import vfsddpm_loss, leave_one_out_c
+from model.vfsddpm_jax import vfsddpm_loss, leave_one_out_c, fix_set_size
 from model.set_diffusion import logger
 from metrics import fid_jax
 from model.set_diffusion.train_util_jax import (
@@ -1056,14 +1056,20 @@ def main():
             for batch in pbar:
                 batch_np = numpy_from_torch(batch)
                 
+                # CRITICAL: Normalize batch to cfg.sample_size BEFORE train_step
+                # This ensures JAX only compiles ONE version (not multiple for different ns)
+                # Must be done BEFORE sharding to ensure consistent shape
+                batch_np_fixed = fix_set_size(jnp.array(batch_np), cfg.sample_size)
+                batch_np_fixed = np.array(batch_np_fixed)  # Convert back to numpy for sharding
+                
                 if use_single_device:
                     # Single device: no sharding needed
-                    batch_sharded = batch_np
+                    batch_sharded = batch_np_fixed
                     rng, step_rng = jax.random.split(rng)
                     step_rngs = step_rng  # Single RNG key, not array
                 else:
                     try:
-                        batch_sharded = shard_batch(batch_np, n_devices)
+                        batch_sharded = shard_batch(batch_np_fixed, n_devices)
                     except AssertionError:
                         # skip incomplete batch
                         continue
@@ -1086,11 +1092,18 @@ def main():
 
                 # host metrics
                 if use_single_device:
-                    # Single device: metrics are already on host
-                    metrics_host = jax.tree.map(lambda x: np.array(x), metrics)
+                    # Single device: metrics are already on host, but may be arrays
+                    # Convert to scalars (mean if array, direct if scalar)
+                    def to_scalar(x):
+                        arr = np.array(x)
+                        if arr.size == 1:
+                            return float(arr.item())
+                        else:
+                            return float(arr.mean())  # Mean if multi-element array
+                    metrics_host = jax.tree.map(to_scalar, metrics)
                 else:
                     # Multi-device: mean over devices
-                    metrics_host = jax.tree.map(lambda x: np.array(x).mean(), metrics)
+                    metrics_host = jax.tree.map(lambda x: float(np.array(x).mean()), metrics)
                 global_step += 1
 
                 # Check if DiT is frozen
@@ -1105,8 +1118,11 @@ def main():
                     logger.log(f"\n{'='*70}")
                     logger.log(f"📊 ITERATION {global_step} - SHAPE & METRICS DEBUG")
                     logger.log(f"{'='*70}")
-                    logger.log(f"Batch (before shard): {batch_np.shape}")
+                    logger.log(f"Batch (original from dataset): {batch_np.shape}")
                     logger.log(f"  → (bs={batch_np.shape[0]}, ns={batch_np.shape[1]}, C={batch_np.shape[2]}, H={batch_np.shape[3]}, W={batch_np.shape[4]})")
+                    logger.log(f"Batch (after fix_set_size): {batch_np_fixed.shape}")
+                    logger.log(f"  → (bs={batch_np_fixed.shape[0]}, ns={batch_np_fixed.shape[1]}, C={batch_np_fixed.shape[2]}, H={batch_np_fixed.shape[3]}, W={batch_np_fixed.shape[4]})")
+                    logger.log(f"  → ✅ Normalized to cfg.sample_size={cfg.sample_size}")
                     logger.log(f"Batch (after shard):  {batch_sharded.shape}")
                     logger.log(f"  → n_devices={n_devices}, per_device_bs={batch_sharded.shape[1] if len(batch_sharded.shape) > 1 else 'N/A'}")
                     logger.log(f"\nMetrics:")

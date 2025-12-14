@@ -652,11 +652,14 @@ def vfsddpm_loss(
     diffusion: GaussianDiffusion = modules["diffusion"]
     dit: DiT = modules["dit"]
 
-    # CRITICAL FIX: Ensure batch_set has exactly cfg.sample_size images
-    # This prevents JAX from compiling multiple versions for different ns values
-    batch_set = fix_set_size(batch_set, cfg.sample_size)
+    # NOTE: batch_set should already be normalized to cfg.sample_size in main_jax.py
+    # before being passed to train_step. This fix_set_size is a safety check.
     b, ns = batch_set.shape[:2]
-    assert ns == cfg.sample_size, f"batch_set ns={ns} != cfg.sample_size={cfg.sample_size}"
+    if ns != cfg.sample_size:
+        # Safety fix: normalize if not already done (shouldn't happen if main_jax.py is correct)
+        batch_set = fix_set_size(batch_set, cfg.sample_size)
+        ns = batch_set.shape[1]
+    assert ns == cfg.sample_size, f"batch_set ns={ns} != cfg.sample_size={cfg.sample_size}. This will cause JAX to compile multiple versions!"
     rng, t_key, noise_key = jax.random.split(rng, 3)
     t = jax.random.randint(t_key, (b,), 0, diffusion.num_timesteps)
     t_rep = jnp.repeat(t, ns, axis=0)

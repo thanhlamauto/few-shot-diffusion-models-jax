@@ -50,7 +50,20 @@ class HumanOutputFormat(KVWriter, SeqWriter):
         # Create strings for printing
         key2str = {}
         for (key, val) in sorted(kvs.items()):
-            if hasattr(val, "__float__"):
+            # Handle JAX arrays and numpy arrays - convert to Python scalar
+            if hasattr(val, "item"):  # numpy/JAX array with .item() method
+                try:
+                    val = val.item()  # Convert to Python scalar
+                except (ValueError, AttributeError):
+                    # If .item() fails (e.g., multi-element array), use mean or first element
+                    if hasattr(val, "shape") and val.size > 1:
+                        val = float(val.mean()) if hasattr(val, "mean") else float(val.flat[0])
+                    else:
+                        val = float(val) if hasattr(val, "__float__") else val
+            elif hasattr(val, "__float__"):
+                val = float(val)
+            
+            if isinstance(val, (int, float)):
                 valstr = "%-8.3g" % val
             else:
                 valstr = str(val)
