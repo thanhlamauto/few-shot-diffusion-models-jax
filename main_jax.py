@@ -624,12 +624,16 @@ def main():
     if not hasattr(args, "model_path"):
         args.model_path = ""
 
+    # Initialize wandb only if explicitly enabled
     if args.use_wandb:
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
             config=vars(args),
         )
+    else:
+        # Explicitly disable wandb to avoid any background processes
+        os.environ["WANDB_MODE"] = "disabled"
 
     print("\nArgs:")
     for k in sorted(vars(args)):

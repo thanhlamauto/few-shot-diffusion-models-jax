@@ -488,6 +488,9 @@ def leave_one_out_c(
         print(f"  - Dropout: {cfg.dropout}", file=sys.stderr)
         leave_one_out_c._logged = True
 
+    # CRITICAL: Ensure ns matches cfg.sample_size (should be guaranteed by fix_set_size in vfsddpm_loss)
+    assert ns == cfg.sample_size, f"ns={ns} != cfg.sample_size={cfg.sample_size}. This will cause JIT to compile multiple versions!"
+    
     kl_list = []
     c_list = []
     rngs = jax.random.split(rng, ns)
@@ -503,7 +506,11 @@ def leave_one_out_c(
         token_set = None
         token_list = []  # Only used if not pre-allocating
     
+    # NOTE: Python for-loop here is OK because ns is now fixed (cfg.sample_size)
+    # JAX will unroll it, but since ns is constant, it only compiles ONE version
     for i in range(ns):
+        # Create indices for leave-one-out: all except i
+        # Since ns is fixed, this list comprehension is traced once per compile
         idx = [k for k in range(ns) if k != i]
         x_subset = batch_set[:, idx]  # (b, ns-1, C, H, W)
         
@@ -607,6 +614,30 @@ def leave_one_out_c(
     return c, klc_total
 
 
+def fix_set_size(batch_set: Array, target_ns: int) -> Array:
+    """
+    Fix batch_set to have exactly target_ns images per set.
+    This ensures consistent shapes for JIT compilation.
+    
+    Args:
+        batch_set: (b, ns, C, H, W)
+        target_ns: Target number of images per set
+        
+    Returns:
+        batch_set: (b, target_ns, C, H, W)
+    """
+    b, ns, C, H, W = batch_set.shape
+    if ns > target_ns:
+        # Crop to target_ns
+        return batch_set[:, :target_ns]
+    elif ns < target_ns:
+        # Pad with zeros
+        pad = jnp.zeros((b, target_ns - ns, C, H, W), dtype=batch_set.dtype)
+        return jnp.concatenate([batch_set, pad], axis=1)
+    else:
+        return batch_set
+
+
 def vfsddpm_loss(
     rng: PRNGKey,
     params: Dict[str, Any],
@@ -621,7 +652,11 @@ def vfsddpm_loss(
     diffusion: GaussianDiffusion = modules["diffusion"]
     dit: DiT = modules["dit"]
 
+    # CRITICAL FIX: Ensure batch_set has exactly cfg.sample_size images
+    # This prevents JAX from compiling multiple versions for different ns values
+    batch_set = fix_set_size(batch_set, cfg.sample_size)
     b, ns = batch_set.shape[:2]
+    assert ns == cfg.sample_size, f"batch_set ns={ns} != cfg.sample_size={cfg.sample_size}"
     rng, t_key, noise_key = jax.random.split(rng, 3)
     t = jax.random.randint(t_key, (b,), 0, diffusion.num_timesteps)
     t_rep = jnp.repeat(t, ns, axis=0)
