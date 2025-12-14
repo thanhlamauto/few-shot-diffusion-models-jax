@@ -744,6 +744,43 @@ def vfsddpm_loss(
         # For film mode: c is (b*ns, hdim) - smaller, but still avoid storing
         losses["debug/context_norm"] = jnp.linalg.norm(c)
         losses["debug/context_mean"] = jnp.mean(jnp.abs(c))
+    
+    # --- DEBUG LOGGING BLOCK START ---
+    # 1. Input stats
+    losses["debug/data_min"] = jnp.min(batch_set)
+    losses["debug/data_max"] = jnp.max(batch_set)
+    losses["debug/data_mean"] = jnp.mean(batch_set)
+    
+    # 2. Context stats (Encoder output)
+    # c shape: (B*ns, hdim) for film or (B*ns, num_patches, hdim) for lag
+    losses["debug/c_mean"] = jnp.mean(c)
+    losses["debug/c_std"] = jnp.std(c)
+    # Compute norm: mean(sqrt(sum(c^2, axis=-1)))
+    # For film: (b*ns, hdim) -> (b*ns,) -> scalar
+    # For lag: (b*ns, num_patches, hdim) -> (b*ns, num_patches) -> scalar
+    losses["debug/c_norm"] = jnp.mean(jnp.sqrt(jnp.sum(c**2, axis=-1)))
+    
+    # 3. Time embedding stats
+    # Re-compute t_emb for comparison
+    base_dim = cfg.hdim // 4
+    t_base = timestep_embedding_jax(t, base_dim)  # (b, base_dim)
+    t_emb_chk = modules["time_embed"].apply(params["time_embed"], t_base)  # (b, hdim)
+    # Compute norm per sample
+    t_norm_per_sample = jnp.sqrt(jnp.sum(t_emb_chk**2, axis=-1))  # (b,)
+    losses["debug/t_norm"] = jnp.mean(t_norm_per_sample)
+    
+    # 4. Signal Ratio (Quan trọng)
+    # If ratio < 0.01, Encoder quá yếu so với Time Embedding
+    losses["debug/signal_ratio_c_t"] = losses["debug/c_norm"] / (losses["debug/t_norm"] + 1e-6)
+    
+    # 5. Additional magnitude comparisons
+    mag_t = jnp.mean(jnp.abs(t_emb_chk))
+    mag_c = jnp.mean(jnp.abs(c))
+    losses["debug/magnitude_time"] = mag_t
+    losses["debug/magnitude_context"] = mag_c
+    losses["debug/ratio_c_over_t"] = mag_c / (mag_t + 1e-6)
+    # --- DEBUG LOGGING BLOCK END ---
+    
     # Don't store c tensor - it's too large and causes memory leak
     return losses
 

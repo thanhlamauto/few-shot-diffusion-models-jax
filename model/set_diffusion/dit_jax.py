@@ -212,10 +212,10 @@ class DiTBlock(nn.Module):
         
         if use_adaln:
             # adaLN modulation params (only for film mode)
-            # Use xavier_uniform instead of constant(0) to prevent vanishing gradient
+            # AdaLN-Zero: initialize with 0
             c_mod = nn.silu(c)
             c_mod = nn.Dense(
-                6 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform()
+                6 * self.hidden_size, kernel_init=nn.initializers.constant(0), bias_init=nn.initializers.constant(0)
             )(c_mod)
             (
                 shift_msa,
@@ -297,9 +297,9 @@ class FinalLayer(nn.Module):
         # Use AdaLN only for film mode
         if self.mode_conditioning == "film":
             # AdaLN modulation for final layer (film mode)
-            # Use xavier_uniform instead of constant(0) to prevent vanishing gradient
+            # AdaLN-Zero: initialize with 0
             c = nn.silu(c)
-            c = nn.Dense(2 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(
+            c = nn.Dense(2 * self.hidden_size, kernel_init=nn.initializers.constant(0), bias_init=nn.initializers.constant(0))(
                 c
             )
             shift, scale = jnp.split(c, 2, axis=-1)

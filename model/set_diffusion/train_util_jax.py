@@ -260,17 +260,33 @@ def train_step_pmap(
             metrics["debug/context_std"] = losses["debug/context_std"]
         
         # 2. Gradient norms (layer-wise)
+        def get_norm(tree):
+            """Helper to compute L2 norm of all leaves in a tree"""
+            leaves = jax.tree_util.tree_leaves(tree)
+            return jnp.sqrt(sum(jnp.sum(g**2) for g in leaves if g is not None))
+        
         if hasattr(grads, 'keys'):
             # Compute gradient norm for each parameter group
+            grad_norm_dit = None
+            grad_norm_encoder = None
+            
             for key in ['dit', 'encoder']:
                 if key in grads and grads[key] is not None:
                     grad_tree = grads[key]
-                    # Flatten all gradients in this tree
-                    flat_grads = jax.tree_util.tree_leaves(grad_tree)
-                    if flat_grads:
-                        # Compute L2 norm of all gradients
-                        grad_norm = jnp.sqrt(sum(jnp.sum(g**2) for g in flat_grads if g is not None))
-                        metrics[f"debug/grad_norm_{key}"] = grad_norm
+                    grad_norm = get_norm(grad_tree)
+                    metrics[f"debug/grad_norm_{key}"] = grad_norm
+                    
+                    if key == 'dit':
+                        grad_norm_dit = grad_norm
+                    elif key == 'encoder':
+                        grad_norm_encoder = grad_norm
+            
+            # Compute ratio: DiT gradient / Encoder gradient
+            # If ratio > 1000, DiT đang học nhưng không truyền tin về Encoder
+            if grad_norm_dit is not None and grad_norm_encoder is not None:
+                metrics["debug/grad_norm_dit_total"] = grad_norm_dit
+                metrics["debug/grad_norm_encoder_total"] = grad_norm_encoder
+                metrics["debug/ratio_grad_dit_enc"] = grad_norm_dit / (grad_norm_encoder + 1e-8)
         
         # 3. Parameter norms (for reference)
         for key in ['dit', 'encoder']:
@@ -354,14 +370,32 @@ def train_step_single_device(
             metrics["debug/context_std"] = losses["debug/context_std"]
         
         # Gradient norms
+        def get_norm(tree):
+            """Helper to compute L2 norm of all leaves in a tree"""
+            leaves = jax.tree_util.tree_leaves(tree)
+            return jnp.sqrt(sum(jnp.sum(g**2) for g in leaves if g is not None))
+        
         if hasattr(grads, 'keys'):
+            grad_norm_dit = None
+            grad_norm_encoder = None
+            
             for key in ['dit', 'encoder']:
                 if key in grads and grads[key] is not None:
                     grad_tree = grads[key]
-                    flat_grads = jax.tree_util.tree_leaves(grad_tree)
-                    if flat_grads:
-                        grad_norm = jnp.sqrt(sum(jnp.sum(g**2) for g in flat_grads if g is not None))
-                        metrics[f"debug/grad_norm_{key}"] = grad_norm
+                    grad_norm = get_norm(grad_tree)
+                    metrics[f"debug/grad_norm_{key}"] = grad_norm
+                    
+                    if key == 'dit':
+                        grad_norm_dit = grad_norm
+                    elif key == 'encoder':
+                        grad_norm_encoder = grad_norm
+            
+            # Compute ratio: DiT gradient / Encoder gradient
+            # If ratio > 1000, DiT đang học nhưng không truyền tin về Encoder
+            if grad_norm_dit is not None and grad_norm_encoder is not None:
+                metrics["debug/grad_norm_dit_total"] = grad_norm_dit
+                metrics["debug/grad_norm_encoder_total"] = grad_norm_encoder
+                metrics["debug/ratio_grad_dit_enc"] = grad_norm_dit / (grad_norm_encoder + 1e-8)
         
         # Parameter norms
         for key in ['dit', 'encoder']:
