@@ -286,6 +286,97 @@ def train_step_pmap(
     return jax.pmap(step, axis_name="devices")
 
 
+def train_step_single_device(
+    tx: optax.GradientTransformation,
+    loss_fn: Callable[[Any, Array, PRNGKey], Dict[str, Array]],
+    ema_rate: float = 0.999,
+    freeze_dit_steps: int = 0,
+):
+    """
+    Returns a JIT-compiled train step for SINGLE DEVICE (no pmap).
+    Useful for debugging compile-OOM issues.
+    
+    Args:
+        freeze_dit_steps: If > 0, freeze DiT parameters for the first N steps (only train encoder)
+    """
+    def step(state: TrainStatePmap, batch, rng):
+        def loss_wrap(p):
+            losses = loss_fn(p, batch, rng)
+            return losses["loss"], losses
+
+        (loss, losses), grads = jax.value_and_grad(loss_wrap, has_aux=True)(state.params)
+        
+        # Freeze DiT for first N steps if enabled
+        if freeze_dit_steps > 0:
+            should_freeze_dit = state.step < freeze_dit_steps
+            
+            # Create masked gradients: zero out DiT grads if frozen
+            def mask_dit_grads(grad_dict):
+                if "dit" in grad_dict:
+                    # Zero out DiT gradients if frozen
+                    dit_grads_masked = jax.lax.cond(
+                        should_freeze_dit,
+                        lambda g: jax.tree.map(jnp.zeros_like, g),  # Freeze: zero grads
+                        lambda g: g,  # Normal: keep grads
+                        grad_dict["dit"]
+                    )
+                    grad_dict_masked = {**grad_dict, "dit": dit_grads_masked}
+                    return grad_dict_masked
+                return grad_dict
+            
+            grads = mask_dit_grads(grads)
+        
+        updates, new_opt_state = tx.update(grads, state.opt_state, state.params)
+        new_params = optax.apply_updates(state.params, updates)
+        new_ema_params = _tree_update_ema(state.ema_params, new_params, rate=ema_rate)
+
+        new_state = TrainStatePmap(
+            params=new_params,
+            ema_params=new_ema_params,
+            opt_state=new_opt_state,
+            step=state.step + 1,
+        )
+
+        # metrics
+        metrics = {"loss": loss}
+        if isinstance(losses, dict):
+            for k, v in losses.items():
+                metrics[k] = v
+        
+        # Compute debug metrics
+        if "debug/context_norm" in losses:
+            metrics["debug/context_norm"] = losses["debug/context_norm"]
+        if "debug/context_mean" in losses:
+            metrics["debug/context_mean"] = losses["debug/context_mean"]
+        if "debug/context_max" in losses:
+            metrics["debug/context_max"] = losses["debug/context_max"]
+        if "debug/context_std" in losses:
+            metrics["debug/context_std"] = losses["debug/context_std"]
+        
+        # Gradient norms
+        if hasattr(grads, 'keys'):
+            for key in ['dit', 'encoder']:
+                if key in grads and grads[key] is not None:
+                    grad_tree = grads[key]
+                    flat_grads = jax.tree_util.tree_leaves(grad_tree)
+                    if flat_grads:
+                        grad_norm = jnp.sqrt(sum(jnp.sum(g**2) for g in flat_grads if g is not None))
+                        metrics[f"debug/grad_norm_{key}"] = grad_norm
+        
+        # Parameter norms
+        for key in ['dit', 'encoder']:
+            if key in new_params and new_params[key] is not None:
+                param_tree = new_params[key]
+                flat_params = jax.tree_util.tree_leaves(param_tree)
+                if flat_params:
+                    param_norm = jnp.sqrt(sum(jnp.sum(p**2) for p in flat_params if p is not None))
+                    metrics[f"debug/param_norm_{key}"] = param_norm
+        
+        return new_state, metrics
+
+    return jax.jit(step)  # Single device: use jit instead of pmap
+
+
 def sample_ema(
     rng: PRNGKey,
     ema_params: Any,

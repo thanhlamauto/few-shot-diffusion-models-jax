@@ -32,6 +32,7 @@ from model.set_diffusion.train_util_jax import (
     create_train_state_pmap,
     shard_batch,
     train_step_pmap,
+    train_step_single_device,
     sample_ema,
 )
 
@@ -648,10 +649,18 @@ def main():
     print(f"RSS start: {rss_gb():.2f} GB")
     print(f"{'='*70}\n")
 
-    n_devices = jax.local_device_count()
-    if args.batch_size % n_devices != 0:
-        raise ValueError(
-            f"batch_size {args.batch_size} must be divisible by n_devices {n_devices}")
+    # Option to run on single device (no pmap) for debugging compile-OOM
+    use_single_device = getattr(args, 'use_single_device', False)
+    
+    if use_single_device:
+        print(f"⚠️  SINGLE DEVICE MODE (no pmap) - for debugging compile-OOM")
+        print(f"   This will run on 1 device only, reducing memory overhead from pmap\n")
+        n_devices = 1
+    else:
+        n_devices = jax.local_device_count()
+        if args.batch_size % n_devices != 0:
+            raise ValueError(
+                f"batch_size {args.batch_size} must be divisible by n_devices {n_devices}")
 
     # Data loaders (PyTorch) on CPU - load BEFORE model init to check dataset memory
     print(f"📂 Loading datasets...")
@@ -857,18 +866,33 @@ def main():
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
     )
-    p_state = jax.device_put_replicated(state, jax.local_devices())
+    
+    if use_single_device:
+        # Single device: no replication needed
+        p_state = state
+    else:
+        # Multi-device: replicate state
+        p_state = jax.device_put_replicated(state, jax.local_devices())
+    
     print(f"RSS after train_state: {rss_gb():.2f} GB")
     print(f"{'='*70}\n")
 
     def loss_fn(p, batch, rng_in):
         return vfsddpm_loss(rng_in, p, modules, batch, cfg, train=True)
 
-    print(f"🔧 Creating pmap(train_step)...")
     freeze_dit_steps = getattr(args, 'freeze_dit_steps', 0)
-    p_train_step = train_step_pmap(
-        tx, loss_fn, ema_rate=float(str(args.ema_rate).split(",")[0]),
-        freeze_dit_steps=freeze_dit_steps)
+    
+    if use_single_device:
+        print(f"🔧 Creating jit(train_step) [SINGLE DEVICE]...")
+        p_train_step = train_step_single_device(
+            tx, loss_fn, ema_rate=float(str(args.ema_rate).split(",")[0]),
+            freeze_dit_steps=freeze_dit_steps)
+    else:
+        print(f"🔧 Creating pmap(train_step)...")
+        p_train_step = train_step_pmap(
+            tx, loss_fn, ema_rate=float(str(args.ema_rate).split(",")[0]),
+            freeze_dit_steps=freeze_dit_steps)
+    
     print(f"RSS after jit(train_step): {rss_gb():.2f} GB")
     print(f"   ⚠️  Note: Actual JIT compilation happens on first call (step 0)")
     print(f"{'='*70}\n")
@@ -971,7 +995,10 @@ def main():
     logger.log(f"  EMA rate: {args.ema_rate}")
     logger.log(f"{'='*70}\n")
     
-    logger.log("starting training (jax pmap)...")
+    if use_single_device:
+        logger.log("starting training (jax jit, SINGLE DEVICE - no pmap)...")
+    else:
+        logger.log("starting training (jax pmap)...")
     logger.log("⚠️  First step will trigger JIT compilation (may take 2-10 minutes)...")
     logger.log("   This is normal - JAX is compiling the training step for optimal performance.")
     logger.log("   Please wait - you'll see progress after compilation completes.\n")
@@ -1028,14 +1055,20 @@ def main():
             pbar = tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch")
             for batch in pbar:
                 batch_np = numpy_from_torch(batch)
-                try:
-                    batch_sharded = shard_batch(batch_np, n_devices)
-                except AssertionError:
-                    # skip incomplete batch
-                    continue
-
-                rng, step_rng = jax.random.split(rng)
-                step_rngs = jax.random.split(step_rng, n_devices)
+                
+                if use_single_device:
+                    # Single device: no sharding needed
+                    batch_sharded = batch_np
+                    rng, step_rng = jax.random.split(rng)
+                    step_rngs = step_rng  # Single RNG key, not array
+                else:
+                    try:
+                        batch_sharded = shard_batch(batch_np, n_devices)
+                    except AssertionError:
+                        # skip incomplete batch
+                        continue
+                    rng, step_rng = jax.random.split(rng)
+                    step_rngs = jax.random.split(step_rng, n_devices)
 
                 # First step triggers JIT compilation - this can take several minutes
                 if global_step == 0:
@@ -1052,7 +1085,12 @@ def main():
                     logger.log("✅ Compilation complete! Training starting...\n")
 
                 # host metrics
-                metrics_host = jax.tree.map(lambda x: np.array(x).mean(), metrics)
+                if use_single_device:
+                    # Single device: metrics are already on host
+                    metrics_host = jax.tree.map(lambda x: np.array(x), metrics)
+                else:
+                    # Multi-device: mean over devices
+                    metrics_host = jax.tree.map(lambda x: np.array(x).mean(), metrics)
                 global_step += 1
 
                 # Check if DiT is frozen
@@ -1418,6 +1456,7 @@ def create_argparser():
         use_wandb=True,
         wandb_project="fsdm-jax",
         wandb_run_name=None,
+        use_single_device=False,  # Set to True to run on 1 device (no pmap) for debugging compile-OOM
         compute_fid=False,
         fid_mode="in",  # "per_class", "in", "out", "both" (in+out)
         # Reduced from 10000 for faster eval
