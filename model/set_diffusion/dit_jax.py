@@ -207,9 +207,10 @@ class DiTBlock(nn.Module):
     @nn.compact
     def __call__(self, x, c, context=None, train: bool = False):
         # adaLN modulation params
+        # Use xavier_uniform instead of constant(0) to prevent vanishing gradient
         c_mod = nn.silu(c)
         c_mod = nn.Dense(
-            6 * self.hidden_size, kernel_init=nn.initializers.constant(0.0)
+            6 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform()
         )(c_mod)
         (
             shift_msa,
@@ -268,8 +269,9 @@ class FinalLayer(nn.Module):
 
     @nn.compact
     def __call__(self, x, c):
+        # Use xavier_uniform instead of constant(0) to prevent vanishing gradient
         c = nn.silu(c)
-        c = nn.Dense(2 * self.hidden_size, kernel_init=nn.initializers.constant(0))(
+        c = nn.Dense(2 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(
             c
         )
         shift, scale = jnp.split(c, 2, axis=-1)

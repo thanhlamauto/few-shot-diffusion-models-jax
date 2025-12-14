@@ -194,7 +194,13 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta):
         except StopIteration:
             break
         batch_np = numpy_from_torch(batch)
+        # CRITICAL: Normalize to cfg.sample_size before calling leave_one_out_c
+        # This ensures consistent shapes and prevents JIT recompilation
+        from model.vfsddpm_jax import fix_set_size
+        batch_np = fix_set_size(jnp.array(batch_np), cfg.sample_size)
+        batch_np = np.array(batch_np)  # Convert back to numpy
         b, ns, c, h, w = batch_np.shape
+        # Now ns == cfg.sample_size guaranteed
         rng, sub = jax.random.split(rng)
         # build conditioning c (host-side, deterministic)
         # Create dummy timestep for encoding (encoder needs t for time_embed)
@@ -339,6 +345,12 @@ def compute_fid_per_class(p_state, modules, cfg, val_dataset, n_samples, rng, us
     for start_idx in range(0, n_sets, batch_size):
         end_idx = min(start_idx + batch_size, n_sets)
         mini_batch = batch_sets[start_idx:end_idx]  # (bs, 6, C, H, W)
+        
+        # CRITICAL: Normalize to cfg_fid.sample_size before calling leave_one_out_c
+        # This ensures consistent shapes and prevents JIT recompilation
+        from model.vfsddpm_jax import fix_set_size
+        mini_batch = fix_set_size(jnp.array(mini_batch), cfg_fid.sample_size)
+        mini_batch = np.array(mini_batch)  # Convert back to numpy
         
         bs = len(mini_batch)
         
@@ -536,6 +548,12 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
         
         # Generate ns images conditioned on this support set
         mini_batch = support_set[None, ...]  # (1, ns, C, H, W)
+        
+        # CRITICAL: Normalize to cfg.sample_size before calling leave_one_out_c
+        # This ensures consistent shapes and prevents JIT recompilation
+        from model.vfsddpm_jax import fix_set_size
+        mini_batch = fix_set_size(jnp.array(mini_batch), cfg.sample_size)
+        mini_batch = np.array(mini_batch)  # Convert back to numpy
         
         sub = {"encoder": ema_params["encoder"],
                "posterior": ema_params.get("posterior"),

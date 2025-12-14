@@ -603,6 +603,15 @@ def leave_one_out_c(
         
         # MEMORY OPTIMIZATION: Pool context tokens to reduce Nk (attention memory scales as Nk^2)
         if cfg.context_pool_size > 0 and cfg.context_pool_size < num_patches:
+            # Validate divisibility before pooling
+            if num_patches % cfg.context_pool_size != 0:
+                raise ValueError(
+                    f"num_patches ({num_patches}) must be divisible by context_pool_size ({cfg.context_pool_size}). "
+                    f"Current config: image_size={cfg.image_size}, patch_size={cfg.patch_size}, "
+                    f"num_patches={(cfg.image_size // cfg.patch_size) ** 2}. "
+                    f"Please adjust context_pool_size to be a divisor of {num_patches}."
+                )
+            
             # Average pool tokens to reduce from num_patches to context_pool_size
             # This reduces attention memory by (num_patches/context_pool_size)^2
             pool_factor = num_patches // cfg.context_pool_size
@@ -657,13 +666,14 @@ def fix_set_size(batch_set: Array, target_ns: int) -> Array:
     """
     b, ns, C, H, W = batch_set.shape
     if ns > target_ns:
-        # Crop to target_ns
+        # Crop to target_ns - take first target_ns images
         return batch_set[:, :target_ns]
     elif ns < target_ns:
-        # Pad with zeros
+        # Pad with zeros to reach target_ns
         pad = jnp.zeros((b, target_ns - ns, C, H, W), dtype=batch_set.dtype)
         return jnp.concatenate([batch_set, pad], axis=1)
     else:
+        # Already correct size, but return explicitly to ensure shape consistency
         return batch_set
 
 
@@ -681,14 +691,13 @@ def vfsddpm_loss(
     diffusion: GaussianDiffusion = modules["diffusion"]
     dit: DiT = modules["dit"]
 
-    # NOTE: batch_set should already be normalized to cfg.sample_size in main_jax.py
-    # before being passed to train_step. This fix_set_size is a safety check.
+    # CRITICAL: Always normalize batch_set to cfg.sample_size to prevent JIT recompilation
+    # This must be done even if ns == cfg.sample_size to ensure consistent shapes
+    # Some batches might have ns != cfg.sample_size due to dataset variations
+    batch_set = fix_set_size(batch_set, cfg.sample_size)
     b, ns = batch_set.shape[:2]
-    if ns != cfg.sample_size:
-        # Safety fix: normalize if not already done (shouldn't happen if main_jax.py is correct)
-        batch_set = fix_set_size(batch_set, cfg.sample_size)
-        ns = batch_set.shape[1]
-    assert ns == cfg.sample_size, f"batch_set ns={ns} != cfg.sample_size={cfg.sample_size}. This will cause JAX to compile multiple versions!"
+    # Double-check after fix_set_size
+    assert ns == cfg.sample_size, f"After fix_set_size: batch_set ns={ns} != cfg.sample_size={cfg.sample_size}. This will cause JAX to compile multiple versions!"
     rng, t_key, noise_key = jax.random.split(rng, 3)
     t = jax.random.randint(t_key, (b,), 0, diffusion.num_timesteps)
     t_rep = jnp.repeat(t, ns, axis=0)
