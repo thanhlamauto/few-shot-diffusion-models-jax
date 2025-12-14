@@ -194,47 +194,62 @@ def modulate(x, shift, scale):
 class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
-    Supports film and lag (cross-attn) conditioning.
+    Supports film (AdaLN only) and lag (cross-attn only) conditioning.
     """
 
     hidden_size: int
     num_heads: int
     mlp_ratio: float = 4.0
     context_channels: int = 0
-    mode_conditioning: str = "film"  # "film" or "lag"
+    mode_conditioning: str = "film"  # "film" (AdaLN only) or "lag" (cross-attn only)
     dropout_rate: float = 0.0
 
     @nn.compact
     def __call__(self, x, c, context=None, train: bool = False):
-        # adaLN modulation params
-        # Use xavier_uniform instead of constant(0) to prevent vanishing gradient
-        c_mod = nn.silu(c)
-        c_mod = nn.Dense(
-            6 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform()
-        )(c_mod)
-        (
-            shift_msa,
-            scale_msa,
-            gate_msa,
-            shift_mlp,
-            scale_mlp,
-            gate_mlp,
-        ) = jnp.split(c_mod, 6, axis=-1)
+        # Use AdaLN only for film mode, cross-attention only for lag mode
+        use_adaln = (self.mode_conditioning == "film")
+        use_cross_attn = (self.mode_conditioning == "lag" and context is not None)
+        
+        if use_adaln:
+            # adaLN modulation params (only for film mode)
+            # Use xavier_uniform instead of constant(0) to prevent vanishing gradient
+            c_mod = nn.silu(c)
+            c_mod = nn.Dense(
+                6 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform()
+            )(c_mod)
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+            ) = jnp.split(c_mod, 6, axis=-1)
 
-        # Self-attention
-        x_norm = nn.LayerNorm(use_bias=False, use_scale=False)(x)
-        x_modulated = modulate(x_norm, shift_msa, scale_msa)
-        attn_x = nn.MultiHeadDotProductAttention(
-            kernel_init=nn.initializers.xavier_uniform(), num_heads=self.num_heads
-        )(x_modulated, x_modulated)
-        attn_x = gate_msa[:, None] * attn_x
-        # Apply dropout to self-attention output
-        if self.dropout_rate > 0:
-            attn_x = nn.Dropout(self.dropout_rate)(attn_x, deterministic=not train)
-        x = x + attn_x
+            # Self-attention with AdaLN
+            x_norm = nn.LayerNorm(use_bias=False, use_scale=False)(x)
+            x_modulated = modulate(x_norm, shift_msa, scale_msa)
+            attn_x = nn.MultiHeadDotProductAttention(
+                kernel_init=nn.initializers.xavier_uniform(), num_heads=self.num_heads
+            )(x_modulated, x_modulated)
+            attn_x = gate_msa[:, None] * attn_x
+            # Apply dropout to self-attention output
+            if self.dropout_rate > 0:
+                attn_x = nn.Dropout(self.dropout_rate)(attn_x, deterministic=not train)
+            x = x + attn_x
+        else:
+            # Standard self-attention without AdaLN (for lag mode)
+            x_norm = nn.LayerNorm(use_bias=False, use_scale=False)(x)
+            attn_x = nn.MultiHeadDotProductAttention(
+                kernel_init=nn.initializers.xavier_uniform(), num_heads=self.num_heads
+            )(x_norm, x_norm)
+            # Apply dropout to self-attention output
+            if self.dropout_rate > 0:
+                attn_x = nn.Dropout(self.dropout_rate)(attn_x, deterministic=not train)
+            x = x + attn_x
 
-        # Cross-attention for lag
-        if self.mode_conditioning == "lag" and context is not None:
+        # Cross-attention (only for lag mode, no AdaLN)
+        if use_cross_attn:
             x_norm_cross = nn.LayerNorm(use_bias=False, use_scale=False)(x)
             context_proj = nn.Dense(
                 self.hidden_size, kernel_init=nn.initializers.xavier_uniform()
@@ -248,13 +263,23 @@ class DiTBlock(nn.Module):
             x = x + cross_attn_x
 
         # MLP
-        x_norm2 = nn.LayerNorm(use_bias=False, use_scale=False)(x)
-        x_modulated2 = modulate(x_norm2, shift_mlp, scale_mlp)
-        mlp_x = MlpBlock(
-            mlp_dim=int(self.hidden_size * self.mlp_ratio),
-            dropout_rate=self.dropout_rate
-        )(x_modulated2, train=train)
-        x = x + (gate_mlp[:, None] * mlp_x)
+        if use_adaln:
+            # MLP with AdaLN (film mode)
+            x_norm2 = nn.LayerNorm(use_bias=False, use_scale=False)(x)
+            x_modulated2 = modulate(x_norm2, shift_mlp, scale_mlp)
+            mlp_x = MlpBlock(
+                mlp_dim=int(self.hidden_size * self.mlp_ratio),
+                dropout_rate=self.dropout_rate
+            )(x_modulated2, train=train)
+            x = x + (gate_mlp[:, None] * mlp_x)
+        else:
+            # Standard MLP without AdaLN (lag mode)
+            x_norm2 = nn.LayerNorm(use_bias=False, use_scale=False)(x)
+            mlp_x = MlpBlock(
+                mlp_dim=int(self.hidden_size * self.mlp_ratio),
+                dropout_rate=self.dropout_rate
+            )(x_norm2, train=train)
+            x = x + mlp_x
         return x
 
 
@@ -269,14 +294,21 @@ class FinalLayer(nn.Module):
 
     @nn.compact
     def __call__(self, x, c):
-        # Use xavier_uniform instead of constant(0) to prevent vanishing gradient
-        c = nn.silu(c)
-        c = nn.Dense(2 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(
-            c
-        )
-        shift, scale = jnp.split(c, 2, axis=-1)
-        x = modulate(nn.LayerNorm(use_bias=False,
-                     use_scale=False)(x), shift, scale)
+        # Use AdaLN only for film mode
+        if self.mode_conditioning == "film":
+            # AdaLN modulation for final layer (film mode)
+            # Use xavier_uniform instead of constant(0) to prevent vanishing gradient
+            c = nn.silu(c)
+            c = nn.Dense(2 * self.hidden_size, kernel_init=nn.initializers.xavier_uniform())(
+                c
+            )
+            shift, scale = jnp.split(c, 2, axis=-1)
+            x = modulate(nn.LayerNorm(use_bias=False,
+                         use_scale=False)(x), shift, scale)
+        else:
+            # Standard LayerNorm without AdaLN (lag mode)
+            x = nn.LayerNorm(use_bias=False, use_scale=False)(x)
+        
         x = nn.Dense(
             self.patch_size * self.patch_size * self.out_channels,
             kernel_init=nn.initializers.constant(0),
@@ -337,7 +369,12 @@ class DiT(nn.Module):
             )(y, train=train, force_drop_ids=force_drop_ids)
             t_emb = t_emb + y_emb
 
+        # Prepare conditioning based on mode:
+        # - film mode: conditioning = t_emb + c (for AdaLN)
+        # - lag mode: conditioning = t_emb (for AdaLN in blocks, but we won't use AdaLN in lag mode)
+        #            context = c (for cross-attention)
         if self.mode_conditioning == "film":
+            # Film mode: use AdaLN with c
             # Create Dense layer unconditionally (required for Flax @nn.compact)
             context_proj_layer = nn.Dense(
                 self.hidden_size, kernel_init=nn.initializers.xavier_uniform()
@@ -353,6 +390,8 @@ class DiT(nn.Module):
                 zero_context_proj = context_proj_layer(dummy_c)
                 conditioning = t_emb + zero_context_proj  # FIX: consistent with c!=None case
         else:
+            # Lag mode: only use t_emb for conditioning (but blocks won't use AdaLN)
+            # c will be passed as context for cross-attention
             conditioning = t_emb
 
         # Parse cross_attn_layers: "all" or comma-separated indices like "2,3,4,5"
