@@ -298,6 +298,8 @@ class DiT(nn.Module):
     context_channels: int = 0
     mode_conditioning: str = "film"  # "film" or "lag"
     dropout_rate: float = 0.0
+    cross_attn_layers: str = "all"  # "all" or comma-separated layer indices (e.g., "2,3,4,5")
+    use_remat: bool = False  # Use gradient checkpointing (remat) to trade compute for memory
 
     @nn.compact
     def __call__(self, x, t, c=None, y=None, train=False, force_drop_ids=None):
