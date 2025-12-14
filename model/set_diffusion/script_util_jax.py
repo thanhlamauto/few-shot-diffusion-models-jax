@@ -77,8 +77,6 @@ def create_model_and_diffusion(
     patch_size,  # DiT: patch_size
     dropout,
     diffusion_steps,
-    cross_attn_layers="all",
-    use_remat=False,
     noise_schedule,
     timestep_respacing,
     use_kl,
@@ -87,6 +85,8 @@ def create_model_and_diffusion(
     rescale_learned_sigmas,
     class_dropout_prob=0.1,
     use_fp16=False,
+    cross_attn_layers="all",
+    use_remat=False,
     # Các tham số không dùng trong DiT (giữ để tương thích)
     channel_mult="",
     num_head_channels=-1,
