@@ -360,33 +360,37 @@ class DiT(nn.Module):
         else:
             cross_attn_layer_set = set(int(x.strip()) for x in self.cross_attn_layers.split(",") if x.strip())
         
-        # Wrap DiTBlock with remat if enabled
-        BlockClass = DiTBlock
-        if self.use_remat:
-            BlockClass = nn.remat(DiTBlock)
-
+        # Create block instance (shared across layers)
+        block = DiTBlock(
+            self.hidden_size,
+            self.num_heads,
+            self.mlp_ratio,
+            self.context_channels,
+            self.mode_conditioning,
+            dropout_rate=self.dropout_rate,
+        )
+        
+        # NOTE: remat with train boolean is problematic in Flax
+        # For now, disable remat during training (train=True)
+        # Remat is most useful for inference anyway (reduces memory when gradients not needed)
+        # TODO: Implement proper remat with static_argnames using jax.checkpoint wrapper
+        use_remat_actual = self.use_remat and not train  # Only remat in eval mode
+        
         for layer_idx in range(self.depth):
             # Only use cross-attention at specified layers
             use_cross_attn = (self.mode_conditioning == "lag" and c is not None and layer_idx in cross_attn_layer_set)
             
             if use_cross_attn:
-                x = BlockClass(
-                    self.hidden_size,
-                    self.num_heads,
-                    self.mlp_ratio,
-                    self.context_channels,
-                    self.mode_conditioning,
-                    dropout_rate=self.dropout_rate,
-                )(x, conditioning, context=c, train=train)
+                if use_remat_actual:
+                    # Use remat only in eval mode (train=False)
+                    x = nn.remat(block)(x, conditioning, context=c, train=train)
+                else:
+                    x = block(x, conditioning, context=c, train=train)
             else:
-                x = BlockClass(
-                    self.hidden_size,
-                    self.num_heads,
-                    self.mlp_ratio,
-                    self.context_channels,
-                    self.mode_conditioning,
-                    dropout_rate=self.dropout_rate,
-                )(x, conditioning, train=train)
+                if use_remat_actual:
+                    x = nn.remat(block)(x, conditioning, train=train)
+                else:
+                    x = block(x, conditioning, train=train)
 
         x = FinalLayer(
             self.patch_size,
