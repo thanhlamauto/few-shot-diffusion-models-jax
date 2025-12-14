@@ -299,7 +299,6 @@ class DiT(nn.Module):
     mode_conditioning: str = "film"  # "film" or "lag"
     dropout_rate: float = 0.0
     cross_attn_layers: str = "all"  # "all" or comma-separated layer indices (e.g., "2,3,4,5")
-    use_remat: bool = False  # Use gradient checkpointing (remat) to trade compute for memory
 
     @nn.compact
     def __call__(self, x, t, c=None, y=None, train=False, force_drop_ids=None):
@@ -360,12 +359,8 @@ class DiT(nn.Module):
         else:
             cross_attn_layer_set = set(int(x.strip()) for x in self.cross_attn_layers.split(",") if x.strip())
         
-        # Create block class (not instance) - remat must be applied to class, not instance
+        # Create block class
         BlockClass = DiTBlock
-        if self.use_remat and not train:
-            # Only apply remat in eval mode (train=False) to avoid train boolean tracing issues
-            # nn.remat must be applied to the class, not an instance
-            BlockClass = nn.remat(DiTBlock)
         
         for layer_idx in range(self.depth):
             # Only use cross-attention at specified layers

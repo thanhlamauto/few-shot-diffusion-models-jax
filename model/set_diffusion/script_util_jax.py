@@ -86,7 +86,6 @@ def create_model_and_diffusion(
     class_dropout_prob=0.1,
     use_fp16=False,
     cross_attn_layers="all",
-    use_remat=False,
     # Các tham số không dùng trong DiT (giữ để tương thích)
     channel_mult="",
     num_head_channels=-1,
@@ -143,7 +142,6 @@ def create_model_and_diffusion(
         class_dropout_prob=class_dropout_prob,
         dropout=dropout,
         cross_attn_layers=cross_attn_layers,
-        use_remat=use_remat,
     )
 
     diffusion = create_gaussian_diffusion(
@@ -175,7 +173,6 @@ def create_dit_model(
     class_dropout_prob=0.1,
     dropout=0.0,
     cross_attn_layers="all",
-    use_remat=False,
 ):
     """
     Create DiT (Diffusion Transformer) model.
@@ -224,7 +221,6 @@ def create_dit_model(
         mode_conditioning=mode_conditioning,
         dropout_rate=dropout,
         cross_attn_layers=cross_attn_layers,
-        use_remat=use_remat,
     )
 
 

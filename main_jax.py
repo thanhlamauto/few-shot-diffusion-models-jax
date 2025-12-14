@@ -1396,7 +1396,6 @@ def create_argparser():
         # Memory optimization for lag mode
         context_pool_size=0,  # If > 0, pool context tokens to this size (reduces Nk, saves memory)
         cross_attn_layers="all",  # "all" or comma-separated layer indices (e.g., "2,3,4,5")
-        use_remat=False,  # Use gradient checkpointing (remat) to trade compute for memory
     ) 
     defaults.update(model_and_diffusion_defaults_jax())
     parser = argparse.ArgumentParser()

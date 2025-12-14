@@ -41,5 +41,4 @@ python main_jax.py \
   --context_channels 256 \
   --mode_conditioning lag \
   --context_pool_size 64 \
-  --cross_attn_layers "2,3,4,5" \
-  --use_remat True
+  --cross_attn_layers "2,3,4,5"

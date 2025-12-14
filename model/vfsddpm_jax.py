@@ -108,7 +108,6 @@ class VFSDDPMConfig:
     # Memory optimization for lag mode
     context_pool_size: int = 0  # If > 0, pool context tokens to this size (reduces Nk, saves memory)
     cross_attn_layers: str = "all"  # "all" or comma-separated layer indices (e.g., "2,3,4,5") to enable cross-attn only at specific layers
-    use_remat: bool = False  # Use gradient checkpointing (remat) to trade compute for memory
 
 
 def build_encoder(cfg: VFSDDPMConfig) -> nn.Module:
@@ -199,7 +198,6 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
         patch_size=cfg.patch_size,
         dropout=cfg.dropout,
         cross_attn_layers=getattr(cfg, "cross_attn_layers", "all"),
-        use_remat=getattr(cfg, "use_remat", False),
         diffusion_steps=cfg.diffusion_steps,
         noise_schedule=cfg.noise_schedule,
         timestep_respacing=cfg.timestep_respacing,
