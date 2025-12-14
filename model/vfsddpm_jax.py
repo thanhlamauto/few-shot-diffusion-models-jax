@@ -105,6 +105,10 @@ class VFSDDPMConfig:
     rescale_learned_sigmas: bool = False
     # context mode
     mode_context: str = "deterministic"  # "deterministic" or "variational"
+    # Memory optimization for lag mode
+    context_pool_size: int = 0  # If > 0, pool context tokens to this size (reduces Nk, saves memory)
+    cross_attn_layers: str = "all"  # "all" or comma-separated layer indices (e.g., "2,3,4,5") to enable cross-attn only at specific layers
+    use_remat: bool = False  # Use gradient checkpointing (remat) to trade compute for memory
 
 
 def build_encoder(cfg: VFSDDPMConfig) -> nn.Module:
@@ -194,6 +198,8 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
         mlp_ratio=cfg.mlp_ratio,
         patch_size=cfg.patch_size,
         dropout=cfg.dropout,
+        cross_attn_layers=getattr(cfg, "cross_attn_layers", "all"),
+        use_remat=getattr(cfg, "use_remat", False),
         diffusion_steps=cfg.diffusion_steps,
         noise_schedule=cfg.noise_schedule,
         timestep_respacing=cfg.timestep_respacing,
@@ -562,6 +568,21 @@ def leave_one_out_c(
         
         # Reshape to (b*ns, num_patches, hdim) for DiT cross-attention
         c = token_set.reshape(b * ns, num_patches, cfg.hdim)
+        
+        # MEMORY OPTIMIZATION: Pool context tokens to reduce Nk (attention memory scales as Nk^2)
+        if cfg.context_pool_size > 0 and cfg.context_pool_size < num_patches:
+            # Average pool tokens to reduce from num_patches to context_pool_size
+            # This reduces attention memory by (num_patches/context_pool_size)^2
+            pool_factor = num_patches // cfg.context_pool_size
+            # Reshape: (b*ns, num_patches, hdim) -> (b*ns, context_pool_size, pool_factor, hdim)
+            c_pooled = c.reshape(b * ns, cfg.context_pool_size, pool_factor, cfg.hdim)
+            # Average pool: (b*ns, context_pool_size, hdim)
+            c = jnp.mean(c_pooled, axis=2)
+            num_patches = cfg.context_pool_size
+            if not hasattr(leave_one_out_c, "_logged_pooling"):
+                import sys
+                print(f"\n[INFO] Context token pooling: {token_set.shape[2]} -> {num_patches} tokens (memory reduction: {(token_set.shape[2]/num_patches)**2:.1f}x)", file=sys.stderr)
+                leave_one_out_c._logged_pooling = True
         
         # ASSERT 6: Final conditioning shape
         assert c.shape == (b * ns, num_patches, cfg.hdim), \

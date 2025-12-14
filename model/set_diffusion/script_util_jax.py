@@ -77,6 +77,8 @@ def create_model_and_diffusion(
     patch_size,  # DiT: patch_size
     dropout,
     diffusion_steps,
+    cross_attn_layers="all",
+    use_remat=False,
     noise_schedule,
     timestep_respacing,
     use_kl,
@@ -140,6 +142,8 @@ def create_model_and_diffusion(
         class_cond=class_cond,
         class_dropout_prob=class_dropout_prob,
         dropout=dropout,
+        cross_attn_layers=cross_attn_layers,
+        use_remat=use_remat,
     )
 
     diffusion = create_gaussian_diffusion(
@@ -170,6 +174,8 @@ def create_dit_model(
     class_cond=False,
     class_dropout_prob=0.1,
     dropout=0.0,
+    cross_attn_layers="all",
+    use_remat=False,
 ):
     """
     Create DiT (Diffusion Transformer) model.
@@ -217,6 +223,8 @@ def create_dit_model(
         context_channels=context_channels,
         mode_conditioning=mode_conditioning,
         dropout_rate=dropout,
+        cross_attn_layers=cross_attn_layers,
+        use_remat=use_remat,
     )
 
 

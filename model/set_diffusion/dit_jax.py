@@ -352,9 +352,23 @@ class DiT(nn.Module):
         else:
             conditioning = t_emb
 
-        for _ in range(self.depth):
-            if self.mode_conditioning == "lag" and c is not None:
-                x = DiTBlock(
+        # Parse cross_attn_layers: "all" or comma-separated indices like "2,3,4,5"
+        if self.cross_attn_layers == "all":
+            cross_attn_layer_set = set(range(self.depth))
+        else:
+            cross_attn_layer_set = set(int(x.strip()) for x in self.cross_attn_layers.split(",") if x.strip())
+        
+        # Wrap DiTBlock with remat if enabled
+        BlockClass = DiTBlock
+        if self.use_remat:
+            BlockClass = nn.remat(DiTBlock)
+
+        for layer_idx in range(self.depth):
+            # Only use cross-attention at specified layers
+            use_cross_attn = (self.mode_conditioning == "lag" and c is not None and layer_idx in cross_attn_layer_set)
+            
+            if use_cross_attn:
+                x = BlockClass(
                     self.hidden_size,
                     self.num_heads,
                     self.mlp_ratio,
@@ -363,7 +377,7 @@ class DiT(nn.Module):
                     dropout_rate=self.dropout_rate,
                 )(x, conditioning, context=c, train=train)
             else:
-                x = DiTBlock(
+                x = BlockClass(
                     self.hidden_size,
                     self.num_heads,
                     self.mlp_ratio,
