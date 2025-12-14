@@ -514,13 +514,28 @@ def leave_one_out_c(
         token_set_carry, c_list_carry, kl_list_carry = carry
         
         # Create leave-one-out indices: all except i
-        # Use JAX operations instead of Python list comprehension
-        idx_before = jnp.arange(i)  # [0, 1, ..., i-1]
-        idx_after = jnp.arange(i + 1, ns)  # [i+1, i+2, ..., ns-1]
-        idx = jnp.concatenate([idx_before, idx_after])  # (ns-1,)
+        # Cannot use jnp.arange(i) because i is traced - use lax.dynamic_slice instead
+        # Slice batch_set into two parts: [0:i] and [i+1:ns], then concatenate
         
-        # Index batch_set to get subset: (b, ns-1, C, H, W)
-        x_subset = batch_set[:, idx]
+        # Part 1: indices [0, 1, ..., i-1] -> slice [0:i]
+        # Part 2: indices [i+1, i+2, ..., ns-1] -> slice [i+1:ns]
+        # Use lax.dynamic_slice which works with traced indices
+        
+        # Get shape info
+        b, _, C, H, W = batch_set.shape
+        
+        # Part 1: slice from start to i (size = i)
+        # If i == 0, this will be empty (size 0), which is fine
+        part1 = lax.dynamic_slice(batch_set, (0, 0, 0, 0, 0), (b, i, C, H, W))  # (b, i, C, H, W)
+        
+        # Part 2: slice from i+1 to end (size = ns - i - 1)
+        # If i == ns-1, this will be empty (size 0), which is fine
+        start_idx = i + 1
+        size_part2 = ns - i - 1
+        part2 = lax.dynamic_slice(batch_set, (0, start_idx, 0, 0, 0), (b, size_part2, C, H, W))  # (b, ns-i-1, C, H, W)
+        
+        # Concatenate parts along axis=1: (b, i, C, H, W) + (b, ns-i-1, C, H, W) -> (b, ns-1, C, H, W)
+        x_subset = jnp.concatenate([part1, part2], axis=1)  # (b, ns-1, C, H, W)
         
         # CRITICAL FIX: For sViT with SPT stacking, pad subset back to sample_size
         # SPT expects fixed sample_size for patch_dim calculation
