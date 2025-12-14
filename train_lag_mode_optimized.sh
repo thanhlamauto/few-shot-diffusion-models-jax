@@ -32,7 +32,7 @@ python main_jax.py \
   --compute_fid True \
   --fid_num_samples 10000 \
   --encoder_depth 6 \
-  --encoder_heads 12 \
+  --encoder_heads 8 \
   --encoder_dim_head 64 \
   --encoder_mlp_ratio 1.0 \
   --encoder_tokenize_mode stack \

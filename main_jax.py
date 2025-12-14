@@ -19,6 +19,8 @@ import traceback
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server use
 import matplotlib.pyplot as plt
+import psutil
+import sys
 
 from dataset import create_loader, select_dataset
 from model import select_model  # keeps existing namespace for non-JAX
@@ -32,6 +34,11 @@ from model.set_diffusion.train_util_jax import (
     train_step_pmap,
     sample_ema,
 )
+
+def rss_gb():
+    """Get current process RSS (Resident Set Size) in GB."""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / (1024 ** 3)
 from model.set_diffusion.script_util_jax import (
     add_dict_to_argparser as add_dict_to_argparser_jax,
     args_to_dict as args_to_dict_jax,
@@ -631,15 +638,32 @@ def main():
 
     logger.configure(dir=DIR, mode="training", args=args, tag="jax")
 
+    print(f"\n{'='*70}")
+    print(f"📊 RAM USAGE TRACKING")
+    print(f"{'='*70}")
+    print(f"RSS start: {rss_gb():.2f} GB")
+    print(f"{'='*70}\n")
+
     n_devices = jax.local_device_count()
     if args.batch_size % n_devices != 0:
         raise ValueError(
             f"batch_size {args.batch_size} must be divisible by n_devices {n_devices}")
 
+    # Data loaders (PyTorch) on CPU - load BEFORE model init to check dataset memory
+    print(f"📂 Loading datasets...")
+    train_loader = create_loader(args, split="train", shuffle=True)
+    val_loader = create_loader(args, split="val", shuffle=False)
+    val_dataset = select_dataset(args, split="val")
+    print(f"RSS after dataset: {rss_gb():.2f} GB")
+    print(f"{'='*70}\n")
+
     rng = jax.random.PRNGKey(getattr(args, "seed", 0))
     rng, rng_model = jax.random.split(rng)
 
+    print(f"🔧 Initializing models...")
     params, modules, cfg = select_model_jax(args, rng_model)
+    print(f"RSS after init_models: {rss_gb():.2f} GB")
+    print(f"{'='*70}\n")
 
     # -----------------------------
     # DEBUG: show what was passed into model init
@@ -823,34 +847,36 @@ def main():
         logger.log(f"{'='*70}\n")
 
     # Train state and optimizer
+    print(f"🔧 Creating train state...")
     state, tx = create_train_state_pmap(
         params,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
     )
     p_state = jax.device_put_replicated(state, jax.local_devices())
+    print(f"RSS after train_state: {rss_gb():.2f} GB")
+    print(f"{'='*70}\n")
 
     def loss_fn(p, batch, rng_in):
         return vfsddpm_loss(rng_in, p, modules, batch, cfg, train=True)
 
+    print(f"🔧 Creating pmap(train_step)...")
     freeze_dit_steps = getattr(args, 'freeze_dit_steps', 0)
     p_train_step = train_step_pmap(
         tx, loss_fn, ema_rate=float(str(args.ema_rate).split(",")[0]),
         freeze_dit_steps=freeze_dit_steps)
-
-    # Data loaders (PyTorch) on CPU
-    train_loader = create_loader(args, split="train", shuffle=True)
-    val_loader = create_loader(args, split="val", shuffle=False)
-    
-    # Store validation dataset separately for FID computation
-    # (val_loader is a generator, doesn't have .dataset attribute)
-    val_dataset = select_dataset(args, split="val")
+    print(f"RSS after jit(train_step): {rss_gb():.2f} GB")
+    print(f"   ⚠️  Note: Actual JIT compilation happens on first call (step 0)")
+    print(f"{'='*70}\n")
 
     # Initialize InceptionV3 for FID computation (if enabled)
     inception_fn = None
     if args.compute_fid:
+        print(f"🔧 Initializing InceptionV3 for FID...")
         try:
             inception_fn = fid_jax.get_fid_fn()
+            print(f"RSS after FID init: {rss_gb():.2f} GB")
+            print(f"{'='*70}\n")
         except Exception as e:
             print(f"\n⚠️  Warning: Could not load InceptionV3: {e}")
             print("FID computation will be skipped.\n")
@@ -1012,10 +1038,13 @@ def main():
                     logger.log("🔄 Compiling training step (first time only)...")
                     logger.log("   This may take 2-10 minutes depending on model complexity.")
                     logger.log("   CPU/GPU usage should be high during compilation.\n")
+                    print(f"RSS before first step (JIT compile): {rss_gb():.2f} GB")
                 
                 p_state, metrics = p_train_step(p_state, batch_sharded, step_rngs)
                 
                 if global_step == 0:
+                    print(f"RSS after first step (JIT compile done): {rss_gb():.2f} GB")
+                    print(f"{'='*70}\n")
                     logger.log("✅ Compilation complete! Training starting...\n")
 
                 # host metrics
