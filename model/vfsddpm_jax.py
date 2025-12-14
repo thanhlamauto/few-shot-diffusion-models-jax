@@ -486,11 +486,18 @@ def leave_one_out_c(
 
     kl_list = []
     c_list = []
-    token_list = []  # For lag mode: collect patch tokens
     rngs = jax.random.split(rng, ns)
     
     # Check if we need tokens for lag mode
     need_tokens = cfg.mode_conditioning == "lag"
+    
+    # Pre-allocate token_set for lag mode to avoid memory overhead from append+stack
+    if need_tokens:
+        num_patches = (cfg.image_size // cfg.patch_size) ** 2
+        token_set = jnp.zeros((b, ns, num_patches, cfg.hdim), dtype=jnp.float32)
+    else:
+        token_set = None
+        token_list = []  # Only used if not pre-allocating
     
     for i in range(ns):
         idx = [k for k in range(ns) if k != i]
@@ -527,7 +534,8 @@ def leave_one_out_c(
                 t_emb=t_emb_subset, return_tokens=True, rng=rngs[i]
             )
             # tokens: (b, num_patches, hdim)
-            token_list.append(tokens)  # Will reshape later
+            # Store directly in pre-allocated array to avoid memory overhead
+            token_set = token_set.at[:, i, :, :].set(tokens)
         else:
             # Only get hc for film mode
             hc = encode_set(
@@ -544,9 +552,7 @@ def leave_one_out_c(
 
     if need_tokens:
         # For lag mode: use patch tokens for cross-attention
-        # token_list: list of (b, num_patches, hdim), length=ns
-        # Stack: (b, ns, num_patches, hdim)
-        token_set = jnp.stack(token_list, axis=1)  # (b, ns, num_patches, hdim)
+        # token_set already pre-allocated: (b, ns, num_patches, hdim)
         num_patches = token_set.shape[2]
         
         # ASSERT 5: Validate final conditioning shape
