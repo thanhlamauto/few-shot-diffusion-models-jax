@@ -147,23 +147,42 @@ class BaseSetsDataset(data.Dataset):
             residual = self.img_cls - value.shape[0]
             if residual > 0:
                 value = np.vstack([value, value[:residual]])
-            # if data is not rescaled between [0, 1] or [-1, 1]
-            if np.max(value) > 1:
-                # / 255
-                value = value / (2**self.n_bits - 1)
+            # MEMORY OPTIMIZATION: Keep images as uint8, normalize on-the-fly in __getitem__
+            # This avoids materializing huge float32 arrays in memory (saves 4x memory)
+            # Check if data is already normalized [0, 1] or needs normalization
+            if np.max(value) <= 1.0 and np.min(value) >= 0.0 and value.dtype == np.float32:
+                # Already normalized float32, keep as is
+                pass
+            elif np.max(value) > 1.0 or value.dtype != np.uint8:
+                # Data is in [0, 255] range or not uint8, convert to uint8
+                # Don't normalize here - will normalize on-the-fly in __getitem__
+                if value.dtype != np.uint8:
+                    # Convert to uint8 if not already
+                    if np.max(value) <= 1.0:
+                        value = (value * 255).astype(np.uint8)
+                    else:
+                        value = value.astype(np.uint8)
             # (b, c, h, w)
             value = value.transpose(0, 3, 1, 2)
             img.append(value.reshape(self.img_cls, -1))
 
         # this works only if we have the same number of samples in each class
-        img = np.array(img, dtype=np.float32)
+        # Keep dtype from individual images (uint8 or float32)
+        img = np.array(img)  # Preserve dtype (uint8 or float32)
         lbl = np.arange(img.shape[0]).reshape(-1, 1)
         lbl = lbl.repeat(self.img_cls, 1)
         return img, lbl, map_cls
 
     def __getitem__(self, item, lbl=None):
         samples = self.data['inputs'][item]
-        # all datasets should be in [0, 1]
+        
+        # MEMORY OPTIMIZATION: Normalize on-the-fly if images are uint8
+        # This avoids materializing huge float32 arrays in memory
+        if samples.dtype == np.uint8:
+            # Normalize uint8 [0, 255] -> [0, 1] -> [-1, 1]
+            samples = samples.astype(np.float32) / 255.0
+        
+        # all datasets should be in [0, 1] or already normalized
         # and self.norm:
         if self.dataset in ['minimagenet', 'cub', 'cifar100', "celeba", "omniglot_back_eval",  "cifar100mix"]:
 
@@ -174,9 +193,13 @@ class BaseSetsDataset(data.Dataset):
                 samples = samples + (np.random.random(samples.shape) - 0.5)
                 samples = samples / 255.
                 samples = samples.astype(np.float32)
+            elif samples.dtype != np.float32:
+                # Ensure float32 for other datasets
+                samples = samples.astype(np.float32)
 
-            # rescale to [-1, 1]
-            samples = 2 * samples - 1
+            # rescale to [-1, 1] if not already
+            if np.max(samples) <= 1.0:
+                samples = 2 * samples - 1
         if lbl:
             targets = self.data['targets'][item]
             return samples, targets
