@@ -630,8 +630,20 @@ def vfsddpm_loss(
         total = total + klc
         losses["klc"] = klc
     losses["loss"] = total
-    # Add context for debugging
-    losses["context"] = c
+    # Add debug metrics from context (scalars only, don't store large tensor)
+    # This avoids memory leak from storing large context tensor in lag mode
+    if cfg.mode_conditioning == "lag":
+        # For lag mode: c is (b*ns, num_patches, hdim) - very large!
+        # Only compute scalar metrics, don't store tensor
+        losses["debug/context_norm"] = jnp.linalg.norm(c)
+        losses["debug/context_mean"] = jnp.mean(jnp.abs(c))
+        losses["debug/context_max"] = jnp.max(jnp.abs(c))
+        losses["debug/context_std"] = jnp.std(c)
+    else:
+        # For film mode: c is (b*ns, hdim) - smaller, but still avoid storing
+        losses["debug/context_norm"] = jnp.linalg.norm(c)
+        losses["debug/context_mean"] = jnp.mean(jnp.abs(c))
+    # Don't store c tensor - it's too large and causes memory leak
     return losses
 
 

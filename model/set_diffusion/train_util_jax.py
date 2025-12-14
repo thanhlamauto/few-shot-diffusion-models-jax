@@ -248,13 +248,16 @@ def train_step_pmap(
                 metrics[k] = v
         
         # Compute debug metrics
-        # 1. Context magnitude (if available)
-        if "context" in losses and losses["context"] is not None:
-            context = losses["context"]
-            metrics["debug/context_norm"] = jnp.linalg.norm(context)
-            metrics["debug/context_mean"] = jnp.mean(jnp.abs(context))
-            metrics["debug/context_max"] = jnp.max(jnp.abs(context))
-            metrics["debug/context_std"] = jnp.std(context)
+        # Note: Context metrics are now computed in loss function to avoid memory leak
+        # Just copy scalar metrics if they exist
+        if "debug/context_norm" in losses:
+            metrics["debug/context_norm"] = losses["debug/context_norm"]
+        if "debug/context_mean" in losses:
+            metrics["debug/context_mean"] = losses["debug/context_mean"]
+        if "debug/context_max" in losses:
+            metrics["debug/context_max"] = losses["debug/context_max"]
+        if "debug/context_std" in losses:
+            metrics["debug/context_std"] = losses["debug/context_std"]
         
         # 2. Gradient norms (layer-wise)
         if hasattr(grads, 'keys'):
