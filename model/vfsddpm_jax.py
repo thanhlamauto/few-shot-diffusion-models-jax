@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import flax.linen as nn
 import jax
+import jax.lax as lax
 import jax.numpy as jnp
 
 from model.set_diffusion.script_util_jax import (
@@ -491,28 +492,35 @@ def leave_one_out_c(
     # CRITICAL: Ensure ns matches cfg.sample_size (should be guaranteed by fix_set_size in vfsddpm_loss)
     assert ns == cfg.sample_size, f"ns={ns} != cfg.sample_size={cfg.sample_size}. This will cause JIT to compile multiple versions!"
     
-    kl_list = []
-    c_list = []
-    rngs = jax.random.split(rng, ns)
-    
     # Check if we need tokens for lag mode
     need_tokens = cfg.mode_conditioning == "lag"
     
-    # Pre-allocate token_set for lag mode to avoid memory overhead from append+stack
+    # Pre-allocate arrays for both modes
     if need_tokens:
         num_patches = (cfg.image_size // cfg.patch_size) ** 2
-        token_set = jnp.zeros((b, ns, num_patches, cfg.hdim), dtype=jnp.float32)
+        init_token_set = jnp.zeros((b, ns, num_patches, cfg.hdim), dtype=jnp.float32)
+        init_c_list = None
     else:
-        token_set = None
-        token_list = []  # Only used if not pre-allocating
+        init_token_set = None
+        init_c_list = jnp.zeros((b, ns, cfg.hdim), dtype=jnp.float32)
     
-    # NOTE: Python for-loop here is OK because ns is now fixed (cfg.sample_size)
-    # JAX will unroll it, but since ns is constant, it only compiles ONE version
-    for i in range(ns):
-        # Create indices for leave-one-out: all except i
-        # Since ns is fixed, this list comprehension is traced once per compile
-        idx = [k for k in range(ns) if k != i]
-        x_subset = batch_set[:, idx]  # (b, ns-1, C, H, W)
+    # Pre-allocate KL list (will be masked later if not variational)
+    init_kl_list = jnp.zeros((ns,), dtype=jnp.float32)
+    
+    rngs = jax.random.split(rng, ns)
+    
+    def body(i, carry):
+        """Body function for lax.fori_loop - processes one leave-one-out iteration"""
+        token_set_carry, c_list_carry, kl_list_carry = carry
+        
+        # Create leave-one-out indices: all except i
+        # Use JAX operations instead of Python list comprehension
+        idx_before = jnp.arange(i)  # [0, 1, ..., i-1]
+        idx_after = jnp.arange(i + 1, ns)  # [i+1, i+2, ..., ns-1]
+        idx = jnp.concatenate([idx_before, idx_after])  # (ns-1,)
+        
+        # Index batch_set to get subset: (b, ns-1, C, H, W)
+        x_subset = batch_set[:, idx]
         
         # CRITICAL FIX: For sViT with SPT stacking, pad subset back to sample_size
         # SPT expects fixed sample_size for patch_dim calculation
@@ -538,41 +546,55 @@ def leave_one_out_c(
             )
             t_emb_subset = jnp.concatenate([t_emb_subset, pad_t_emb], axis=0)  # (b * subset_ns, hdim)
         
+        # Encode subset
         if need_tokens:
             # Get both hc and tokens for lag mode
             hc, tokens = encode_set(
-                params["encoder"], enc, x_subset, cfg, train=train, 
+                params["encoder"], enc, x_subset, cfg, train=train,
                 t_emb=t_emb_subset, return_tokens=True, rng=rngs[i]
             )
             # tokens: (b, num_patches, hdim)
-            # Store directly in pre-allocated array to avoid memory overhead
-            token_set = token_set.at[:, i, :, :].set(tokens)
+            # Update token_set at index i
+            token_set_carry = token_set_carry.at[:, i, :, :].set(tokens)
         else:
             # Only get hc for film mode
             hc = encode_set(
-                params["encoder"], enc, x_subset, cfg, train=train, 
+                params["encoder"], enc, x_subset, cfg, train=train,
                 t_emb=t_emb_subset, return_tokens=False, rng=rngs[i]
             )
         
         # Apply posterior if variational (works on pooled hc ONLY, not tokens)
         # CRITICAL: c_vec is only for KL loss, NOT used for conditioning in lag mode
         c_vec, klc = sample_context(rngs[i], hc, cfg, posterior, params_post)
-        c_list.append(c_vec[:, None, ...])  # keep set slot: (b, 1, hdim) - only for logging/debug
+        
+        # Update c_list for film mode
+        if not need_tokens:
+            # Store c_vec in pre-allocated array: (b, hdim) -> (b, 1, hdim) -> store at index i
+            c_list_carry = c_list_carry.at[:, i, :].set(c_vec)
+        
+        # Update KL list if variational
         if klc is not None:
-            kl_list.append(klc)
+            kl_list_carry = kl_list_carry.at[i].set(klc)
+        
+        return (token_set_carry, c_list_carry, kl_list_carry)
+    
+    # Run the loop using lax.fori_loop (prevents unrolling in JIT)
+    final_token_set, final_c_list, final_kl_list = lax.fori_loop(
+        0, ns, body, (init_token_set, init_c_list, init_kl_list)
+    )
 
     if need_tokens:
         # For lag mode: use patch tokens for cross-attention
-        # token_set already pre-allocated: (b, ns, num_patches, hdim)
-        num_patches = token_set.shape[2]
+        # final_token_set: (b, ns, num_patches, hdim)
+        num_patches = final_token_set.shape[2]
         
         # ASSERT 5: Validate final conditioning shape
-        assert token_set.shape[0] == b, f"token_set batch mismatch: got {token_set.shape[0]}, expected {b}"
-        assert token_set.shape[1] == ns, f"token_set ns mismatch: got {token_set.shape[1]}, expected {ns}"
-        assert token_set.shape[3] == cfg.hdim, f"token_set hdim mismatch: got {token_set.shape[3]}, expected {cfg.hdim}"
+        assert final_token_set.shape[0] == b, f"token_set batch mismatch: got {final_token_set.shape[0]}, expected {b}"
+        assert final_token_set.shape[1] == ns, f"token_set ns mismatch: got {final_token_set.shape[1]}, expected {ns}"
+        assert final_token_set.shape[3] == cfg.hdim, f"token_set hdim mismatch: got {final_token_set.shape[3]}, expected {cfg.hdim}"
         
         # Reshape to (b*ns, num_patches, hdim) for DiT cross-attention
-        c = token_set.reshape(b * ns, num_patches, cfg.hdim)
+        c = final_token_set.reshape(b * ns, num_patches, cfg.hdim)
         
         # MEMORY OPTIMIZATION: Pool context tokens to reduce Nk (attention memory scales as Nk^2)
         if cfg.context_pool_size > 0 and cfg.context_pool_size < num_patches:
@@ -586,7 +608,7 @@ def leave_one_out_c(
             num_patches = cfg.context_pool_size
             if not hasattr(leave_one_out_c, "_logged_pooling"):
                 import sys
-                print(f"\n[INFO] Context token pooling: {token_set.shape[2]} -> {num_patches} tokens (memory reduction: {(token_set.shape[2]/num_patches)**2:.1f}x)", file=sys.stderr)
+                print(f"\n[INFO] Context token pooling: {final_token_set.shape[2]} -> {num_patches} tokens (memory reduction: {(final_token_set.shape[2]/num_patches)**2:.1f}x)", file=sys.stderr)
                 leave_one_out_c._logged_pooling = True
         
         # ASSERT 6: Final conditioning shape
@@ -597,19 +619,21 @@ def leave_one_out_c(
         if not hasattr(leave_one_out_c, "_logged_tokens"):
             import sys
             print(f"\n[DEBUG leave_one_out_c] Using patch tokens for lag mode:", file=sys.stderr)
-            print(f"  - token_set shape: {token_set.shape}", file=sys.stderr)
+            print(f"  - token_set shape: {final_token_set.shape}", file=sys.stderr)
             print(f"  - c (final) shape: {c.shape}", file=sys.stderr)
             print(f"  - num_patches: {num_patches}", file=sys.stderr)
             print(f"  - Expected: (b*ns={b*ns}, num_patches={num_patches}, hdim={cfg.hdim})", file=sys.stderr)
             leave_one_out_c._logged_tokens = True
     else:
         # For film mode: use pooled vectors
-        c_set = jnp.concatenate(c_list, axis=1)  # (b, ns, hdim)
-        c = c_set.reshape(b * ns, c_set.shape[-1])  # (b*ns, hdim)
+        # final_c_list: (b, ns, hdim)
+        c = final_c_list.reshape(b * ns, cfg.hdim)
 
+    # Compute KL total (mask out unused entries if not variational)
     klc_total = None
-    if kl_list:
-        klc_total = jnp.stack(kl_list, axis=0).mean()
+    if cfg.mode_context == "variational":
+        # All entries in final_kl_list are valid
+        klc_total = final_kl_list.mean()
 
     return c, klc_total
 
