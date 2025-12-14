@@ -4,8 +4,7 @@
 # Sử dụng các tối ưu memory:
 # 1. Context pooling: giảm Nk từ 256 -> 64 (giảm 16x attention memory)
 # 2. Cross-attn chỉ ở 4 layer cuối (giảm 50% cross-attn layers)
-# 3. Remat: gradient checkpointing (giảm 30-50% peak memory)
-# 4. Batch size và sample size nhỏ
+# 3. Batch size và sample size nhỏ
 
 python main_jax.py \
   --model vfsddpm_jax \
