@@ -446,16 +446,27 @@ class GaussianDiffusion:
         cond_fn: Optional[Callable[..., Array]] = None,
         model_kwargs: Optional[Dict[str, Any]] = None,
         eta: float = 0.0,
+        ddim_num_steps: Optional[int] = None,
     ) -> Array:
+        """
+        DDIM sampling loop with optional timestep respacing.
+        
+        Args:
+            ddim_num_steps: Number of DDIM sampling steps. If None, use all timesteps.
+                           Typical values: 50, 100, 250 for faster sampling.
+        """
         if noise is not None:
             img = noise
         else:
             rng, sub = jax.random.split(rng)
             img = jax.random.normal(sub, shape)
 
-        for i in reversed(range(self.num_timesteps)):
+        # Get timesteps to use (with respacing if ddim_num_steps is specified)
+        timesteps = self._get_ddim_timesteps(ddim_num_steps)
+
+        for i in timesteps:
             rng, sub = jax.random.split(rng)
-            t = jnp.full((shape[0],), i, dtype=jnp.int32)
+            t = jnp.full((shape[0],), int(i), dtype=jnp.int32)
             out = self.ddim_sample(
                 sub,
                 model,
@@ -1007,6 +1018,47 @@ class GaussianDiffusion:
     # DDIM sampling (deterministic when eta=0)
     # ----------------------------------------------------------------------
 
+    def _get_ddim_timesteps(self, ddim_num_steps: Optional[int] = None) -> Array:
+        """
+        Get timesteps for DDIM sampling with respacing.
+        
+        Args:
+            ddim_num_steps: Number of DDIM sampling steps. If None, use all timesteps.
+        
+        Returns:
+            Array of timestep indices to use (in reverse order, from num_timesteps-1 to 0)
+        """
+        if ddim_num_steps is None or ddim_num_steps >= self.num_timesteps:
+            # Use all timesteps
+            return jnp.arange(self.num_timesteps - 1, -1, -1)
+        
+        # Calculate stride to get exactly ddim_num_steps
+        # We want to sample from [0, num_timesteps-1] with ddim_num_steps steps
+        # Stride = (num_timesteps - 1) / (ddim_num_steps - 1)
+        if ddim_num_steps == 1:
+            # Only sample at the last timestep
+            return jnp.array([self.num_timesteps - 1])
+        
+        # Calculate evenly spaced timesteps in reverse order
+        # Start from num_timesteps-1, go down to 0
+        stride = (self.num_timesteps - 1) / (ddim_num_steps - 1)
+        timesteps = []
+        for i in range(ddim_num_steps):
+            t = round(i * stride)
+            # Convert to reverse order (from num_timesteps-1 down to 0)
+            timestep = self.num_timesteps - 1 - t
+            timesteps.append(timestep)
+        
+        # Ensure we have exactly ddim_num_steps unique timesteps
+        timesteps = sorted(set(timesteps), reverse=True)
+        if len(timesteps) != ddim_num_steps:
+            # Fallback: use evenly spaced indices
+            indices = np.linspace(0, self.num_timesteps - 1, ddim_num_steps, dtype=int)
+            timesteps = (self.num_timesteps - 1 - indices).tolist()
+            timesteps = sorted(set(timesteps), reverse=True)
+        
+        return jnp.array(timesteps)
+
     def ddim_sample(
         self,
         rng: jax.Array,
@@ -1073,16 +1125,27 @@ class GaussianDiffusion:
         cond_fn: Optional[Callable[..., Array]] = None,
         model_kwargs: Optional[Dict[str, Any]] = None,
         eta: float = 0.0,
+        ddim_num_steps: Optional[int] = None,
     ) -> Array:
+        """
+        DDIM sampling loop with optional timestep respacing.
+        
+        Args:
+            ddim_num_steps: Number of DDIM sampling steps. If None, use all timesteps.
+                           Typical values: 50, 100, 250 for faster sampling.
+        """
         if noise is not None:
             img = noise
         else:
             rng, sub = jax.random.split(rng)
             img = jax.random.normal(sub, shape)
 
-        for i in reversed(range(self.num_timesteps)):
+        # Get timesteps to use (with respacing if ddim_num_steps is specified)
+        timesteps = self._get_ddim_timesteps(ddim_num_steps)
+
+        for i in timesteps:
             rng, sub = jax.random.split(rng)
-            t = jnp.full((shape[0],), i, dtype=jnp.int32)
+            t = jnp.full((shape[0],), int(i), dtype=jnp.int32)
             out = self.ddim_sample(
                 sub,
                 model,

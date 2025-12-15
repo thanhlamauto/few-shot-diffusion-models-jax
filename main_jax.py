@@ -170,7 +170,7 @@ def eval_loop(p_state, modules, cfg, loader, n_devices, num_batches):
     return float(np.mean(losses))
 
 
-def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta):
+def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta, ddim_num_steps=None):
     """
     Minimal sampling: use first batches from loader, build conditioning, and run diffusion.
     Saves .npz files with samples/cond and returns samples for logging.
@@ -212,7 +212,8 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta):
         model_apply = lambda params, x, t, c=None, **kw: dit.apply(
             params, x, t, c=c, **kw)
         samples = sample_ema(sub, ema_params["dit"], diffusion, model_apply,
-                             shape, conditioning=c_cond, use_ddim=use_ddim, eta=eta)
+                             shape, conditioning=c_cond, use_ddim=use_ddim, eta=eta,
+                             ddim_num_steps=ddim_num_steps)
         # save npz
         out_path = os.path.join(DIR, f"samples_{i:03d}.npz")
         np.savez(out_path, samples=np.array(samples), cond=batch_np)
@@ -224,7 +225,7 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta):
     return np.concatenate(all_samples, axis=0) if all_samples else None, \
         np.concatenate(all_support, axis=0) if all_support else None
 
-def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, use_ddim, eta, inception_fn, args):
+def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, use_ddim, eta, inception_fn, args, ddim_num_steps=None):
     """
     Compute FID on mixture distribution of multiple classes (Paper methodology).
     
@@ -353,7 +354,8 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
         rng, sample_rng = jax.random.split(rng)
         samples = sample_ema(
             sample_rng, ema_params["dit"], diffusion, model_apply,
-            shape, conditioning=c_cond, use_ddim=use_ddim, eta=eta
+            shape, conditioning=c_cond, use_ddim=use_ddim, eta=eta,
+            ddim_num_steps=ddim_num_steps
         )
         
         all_generated.append(np.array(samples))
@@ -841,7 +843,8 @@ def main():
                     
                     fid_result = compute_fid_mixture(
                         p_state, modules, cfg, split,
-                        args.fid_num_samples, rng, args.use_ddim, args.eta, inception_fn, args
+                        args.fid_num_samples, rng, args.use_ddim, args.eta, inception_fn, args,
+                        ddim_num_steps=args.ddim_num_steps
                     )
                     
                     if fid_result is not None and isinstance(fid_result, tuple):
@@ -1044,7 +1047,8 @@ def main():
 
                     # Generate samples and log to wandb
                     samples, support = sample_loop(
-                        p_state, modules, cfg, val_loader, args.num_sample_batches, rng, args.use_ddim, args.eta)
+                        p_state, modules, cfg, val_loader, args.num_sample_batches, rng, args.use_ddim, args.eta,
+                        ddim_num_steps=args.ddim_num_steps)
 
                     # Initialize log_dict (will be used for both wandb and non-wandb cases)
                     log_dict = {"eval_loss": eval_loss}
@@ -1172,7 +1176,8 @@ def main():
                                 
                                 fid_result = compute_fid_mixture(
                                     p_state, modules, cfg, split,
-                                    args.fid_num_samples, rng, args.use_ddim, args.eta, inception_fn, args
+                                    args.fid_num_samples, rng, args.use_ddim, args.eta, inception_fn, args,
+                                    ddim_num_steps=args.ddim_num_steps
                                 )
                                 
                                 if fid_result is not None:
@@ -1274,6 +1279,7 @@ def create_argparser():
         clip_denoised=True,
         use_ddim=True,
         eta=0.0,
+        ddim_num_steps=100,  # Number of DDIM sampling steps (None = use all timesteps)
         tag=None,
         seed=0,
         use_wandb=True,

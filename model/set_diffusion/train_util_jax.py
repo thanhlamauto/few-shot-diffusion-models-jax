@@ -421,9 +421,14 @@ def sample_ema(
     use_ddim: bool = False,
     eta: float = 0.0,
     clip_denoised: bool = True,
+    ddim_num_steps: Optional[int] = None,
 ):
     """
     Sampling helper that uses provided EMA params and model_apply.
+    
+    Args:
+        ddim_num_steps: Number of DDIM sampling steps. If None, use all timesteps.
+                       Typical values: 50, 100, 250 for faster sampling.
     """
     apply = lambda x, t, c=None, **kw: model_apply(ema_params, x, t, c, train=False, **kw)
     if use_ddim:
@@ -434,6 +439,7 @@ def sample_ema(
             c=conditioning,
             clip_denoised=clip_denoised,
             eta=eta,
+            ddim_num_steps=ddim_num_steps,
         )
     return diffusion.p_sample_loop(
         rng,
