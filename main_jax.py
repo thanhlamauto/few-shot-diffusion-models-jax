@@ -670,6 +670,8 @@ def main():
         params,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
+        encoder_lr=args.encoder_lr,
+        dit_lr=args.dit_lr,
     )
     
     if use_single_device:
@@ -794,7 +796,9 @@ def main():
     logger.log(f"  Mode: {cfg.mode_context}")
     logger.log(f"")
     logger.log(f"Training:")
-    logger.log(f"  Learning rate: {args.lr}")
+    logger.log(f"  Learning rate (global): {args.lr}")
+    logger.log(f"  Encoder LR: {args.encoder_lr if args.encoder_lr is not None else args.lr}")
+    logger.log(f"  DiT LR: {args.dit_lr if args.dit_lr is not None else args.lr}")
     logger.log(f"  Weight decay: {args.weight_decay}")
     logger.log(f"  Max steps: {args.max_steps if args.max_steps > 0 else 'infinite'}")
     logger.log(f"  EMA rate: {args.ema_rate}")
@@ -1263,7 +1267,9 @@ def create_argparser():
         augment=False,
         data_dir="/home/gigi/ns_data",
         num_classes=1,
-        lr=1e-4,
+        lr=1e-4,              # Global LR (fallback)
+        encoder_lr=None,      # Optional: separate LR for encoder
+        dit_lr=None,          # Optional: separate LR for denoiser (DiT)
         weight_decay=0.0,
         lr_anneal_steps=0,
         max_steps=0,  # 0 means infinite, set to positive number to limit training

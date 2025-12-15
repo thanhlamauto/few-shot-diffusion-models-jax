@@ -163,8 +163,48 @@ def create_train_state_pmap(
     params: Any,
     learning_rate: float = 1e-4,
     weight_decay: float = 0.0,
+    encoder_lr: Optional[float] = None,
+    dit_lr: Optional[float] = None,
 ):
-    tx = optax.adamw(learning_rate=learning_rate, weight_decay=weight_decay)
+    """
+    Create TrainStatePmap with (optionally) different learning rates for encoder vs denoiser (DiT).
+    """
+    # Resolve per-module learning rates (fall back to global learning_rate)
+    lr_encoder = encoder_lr if encoder_lr is not None else learning_rate
+    lr_dit = dit_lr if dit_lr is not None else learning_rate
+
+    # Build parameter labels: mark which params use encoder LR vs DiT LR
+    def label_subtree(subtree, label: str):
+        return jax.tree_map(lambda _: label, subtree)
+
+    param_labels = {}
+    if isinstance(params, dict):
+        if "encoder" in params:
+            param_labels["encoder"] = label_subtree(params["encoder"], "encoder")
+        if "posterior" in params:
+            # Treat posterior as part of encoder (set-level context)
+            param_labels["posterior"] = label_subtree(params["posterior"], "encoder")
+        if "time_embed" in params:
+            # Time embedding is tightly coupled with denoiser
+            param_labels["time_embed"] = label_subtree(params["time_embed"], "dit")
+        if "dit" in params:
+            param_labels["dit"] = label_subtree(params["dit"], "dit")
+
+        # Any remaining modules default to DiT LR
+        for k, v in params.items():
+            if k not in param_labels:
+                param_labels[k] = label_subtree(v, "dit")
+    else:
+        # Fallback: single transform for whole tree
+        param_labels = jax.tree_map(lambda _: "dit", params)
+
+    # Define separate optimizers
+    tx_config = {
+        "encoder": optax.adamw(learning_rate=lr_encoder, weight_decay=weight_decay),
+        "dit": optax.adamw(learning_rate=lr_dit, weight_decay=weight_decay),
+    }
+    tx = optax.multi_transform(tx_config, param_labels)
+
     opt_state = tx.init(params)
     return TrainStatePmap(
         params=params,
