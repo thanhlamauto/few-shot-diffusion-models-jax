@@ -497,6 +497,7 @@ def main():
         "encoder_tokenize_mode",
         "mode_conditioning",
         "mode_context",
+        "input_dependent",
         # DiT
         "hidden_size",
         "depth",
@@ -631,6 +632,11 @@ def main():
     logger.log(f"CONDITIONING CONFIGURATION:")
     logger.log(f"{'='*70}")
     logger.log(f"  Mode: {cfg.mode_conditioning.upper()}")
+    logger.log(f"  Input-dependent: {cfg.input_dependent}")
+    if cfg.input_dependent:
+        logger.log(f"    ✅ Context includes the sample being generated (better OOD performance)")
+    else:
+        logger.log(f"    ✅ Leave-One-Out (LOO): context excludes the sample being generated (better in-distribution)")
     if cfg.mode_conditioning == "lag":
         logger.log(f"  ✅ Using CROSS-ATTENTION with patch tokens")
         num_patches = (cfg.image_size // cfg.patch_size) ** 2
@@ -1245,6 +1251,10 @@ def create_argparser():
         context_channels=448,  # Match with hidden_size (must be divisible by 4)
         mode_context="deterministic",
         mode_conditioning="film",
+        # Input-dependent vs input-independent context (FSDM paper)
+        # True: input-dependent (context includes sample being generated) - better OOD performance
+        # False: input-independent/LOO (context excludes sample being generated) - better in-distribution
+        input_dependent=False,  # Default to LOO for backward compatibility
         augment=False,
         data_dir="/home/gigi/ns_data",
         num_classes=1,

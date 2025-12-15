@@ -106,6 +106,10 @@ class VFSDDPMConfig:
     rescale_learned_sigmas: bool = False
     # context mode
     mode_context: str = "deterministic"  # "deterministic" or "variational"
+    # Input-dependent vs input-independent context (FSDM paper)
+    # True: input-dependent (context includes the sample being generated) - better OOD performance
+    # False: input-independent/LOO (context excludes the sample being generated) - better in-distribution
+    input_dependent: bool = False  # Default to LOO (input-independent) for backward compatibility
     # Memory optimization for lag mode
     context_pool_size: int = 0  # If > 0, pool context tokens to this size (reduces Nk, saves memory)
     cross_attn_layers: str = "all"  # "all" or comma-separated layer indices (e.g., "2,3,4,5") to enable cross-attn only at specific layers
@@ -462,7 +466,12 @@ def leave_one_out_c(
     t: Array,  # (b,) integer timesteps
 ) -> Tuple[Array, Optional[Array]]:
     """
-    Build conditioning c for each element via leave-one-out over the set.
+    Build conditioning c for each element.
+    
+    Two modes (FSDM paper):
+    - input_dependent=False (LOO): context excludes the sample being generated
+    - input_dependent=True: context includes the sample being generated (better OOD)
+    
     Returns (c, klc_optional).
     Shapes:
         film -> c: (bs * ns, hdim) - pooled vector
@@ -510,26 +519,31 @@ def leave_one_out_c(
     rngs = jax.random.split(rng, ns)
     
     def body(i, carry):
-        """Body function for lax.fori_loop - processes one leave-one-out iteration"""
+        """Body function for lax.fori_loop - processes one iteration"""
         token_set_carry, c_list_carry, kl_list_carry = carry
         
-        # Create leave-one-out indices: all except i
-        # Cannot use jnp.arange(i), lax.dynamic_slice, jnp.compress, or jnp.sort with traced i
-        # Use jnp.where to create source indices mapping directly
-        
-        # Method: For output position j in [0, ns-2], map to source position:
-        # - If j < i: source = j (take from position j)
-        # - If j >= i: source = j+1 (take from position j+1, skipping i)
-        output_positions = jnp.arange(ns - 1)  # [0, 1, ..., ns-2] - ns-1 is concrete
-        source_indices = jnp.where(output_positions < i, output_positions, output_positions + 1)
-        
-        # Use jnp.take to select elements from batch_set using source_indices
-        # batch_set shape: (b, ns, C, H, W), we want (b, ns-1, C, H, W)
-        x_subset = jnp.take(batch_set, source_indices, axis=1)  # (b, ns-1, C, H, W)
+        if cfg.input_dependent:
+            # Input-dependent: use full set including sample i
+            x_subset = batch_set  # (b, ns, C, H, W) - includes all samples
+            subset_ns_original = ns
+        else:
+            # Input-independent (LOO): exclude sample i
+            # Cannot use jnp.arange(i), lax.dynamic_slice, jnp.compress, or jnp.sort with traced i
+            # Use jnp.where to create source indices mapping directly
+            
+            # Method: For output position j in [0, ns-2], map to source position:
+            # - If j < i: source = j (take from position j)
+            # - If j >= i: source = j+1 (take from position j+1, skipping i)
+            output_positions = jnp.arange(ns - 1)  # [0, 1, ..., ns-2] - ns-1 is concrete
+            source_indices = jnp.where(output_positions < i, output_positions, output_positions + 1)
+            
+            # Use jnp.take to select elements from batch_set using source_indices
+            # batch_set shape: (b, ns, C, H, W), we want (b, ns-1, C, H, W)
+            x_subset = jnp.take(batch_set, source_indices, axis=1)  # (b, ns-1, C, H, W)
+            subset_ns_original = ns - 1
         
         # CRITICAL FIX: For sViT with SPT stacking, pad subset back to sample_size
         # SPT expects fixed sample_size for patch_dim calculation
-        subset_ns_original = ns - 1
         if cfg.encoder_mode == "vit_set" and x_subset.shape[1] < cfg.sample_size:
             # Pad with zeros to maintain sample_size
             pad_size = cfg.sample_size - x_subset.shape[1]

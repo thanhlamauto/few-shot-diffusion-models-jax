@@ -43,6 +43,7 @@ def select_model_jax(args, rng: jax.Array) -> Tuple[Dict[str, Any], Dict[str, An
         rescale_timesteps=args.rescale_timesteps,
         rescale_learned_sigmas=args.rescale_learned_sigmas,
         mode_context=args.mode_context,
+        input_dependent=getattr(args, "input_dependent", False),
         context_pool_size=getattr(args, "context_pool_size", 0),
         cross_attn_layers=getattr(args, "cross_attn_layers", "all"),
     )
