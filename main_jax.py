@@ -721,8 +721,14 @@ def main():
     else:
         print(f"🔧 Creating pmap(train_step)...")
         p_train_step = train_step_pmap(
-            tx, loss_fn, ema_rate=float(str(args.ema_rate).split(",")[0]),
-            freeze_dit_steps=freeze_dit_steps)
+            tx,
+            loss_fn,
+            ema_rate=float(str(args.ema_rate).split(",")[0]),
+            freeze_dit_steps=freeze_dit_steps,
+            base_lr=args.lr,
+            encoder_lr=args.encoder_lr,
+            dit_lr=args.dit_lr,
+        )
     
     print(f"RSS after jit(train_step): {rss_gb():.2f} GB")
     print(f"   ⚠️  Note: Actual JIT compilation happens on first call (step 0)")

@@ -167,45 +167,11 @@ def create_train_state_pmap(
     dit_lr: Optional[float] = None,
 ):
     """
-    Create TrainStatePmap with (optionally) different learning rates for encoder vs denoiser (DiT).
+    Create TrainStatePmap.
+    Note: encoder_lr / dit_lr are handled in train_step_pmap via gradient scaling.
+    Here we keep a single AdamW optimizer for numerical stability.
     """
-    # Resolve per-module learning rates (fall back to global learning_rate)
-    lr_encoder = encoder_lr if encoder_lr is not None else learning_rate
-    lr_dit = dit_lr if dit_lr is not None else learning_rate
-
-    # Build parameter labels: mark which params use encoder LR vs DiT LR
-    def label_subtree(subtree, label: str):
-        # NOTE: jax.tree_map is deprecated in JAX >=0.6.0; use jax.tree.map instead.
-        return jax.tree.map(lambda _: label, subtree)
-
-    param_labels = {}
-    if isinstance(params, dict):
-        if "encoder" in params:
-            param_labels["encoder"] = label_subtree(params["encoder"], "encoder")
-        if "posterior" in params:
-            # Treat posterior as part of encoder (set-level context)
-            param_labels["posterior"] = label_subtree(params["posterior"], "encoder")
-        if "time_embed" in params:
-            # Time embedding is tightly coupled with denoiser
-            param_labels["time_embed"] = label_subtree(params["time_embed"], "dit")
-        if "dit" in params:
-            param_labels["dit"] = label_subtree(params["dit"], "dit")
-
-        # Any remaining modules default to DiT LR
-        for k, v in params.items():
-            if k not in param_labels:
-                param_labels[k] = label_subtree(v, "dit")
-    else:
-        # Fallback: single transform for whole tree
-        param_labels = jax.tree_map(lambda _: "dit", params)
-
-    # Define separate optimizers
-    tx_config = {
-        "encoder": optax.adamw(learning_rate=lr_encoder, weight_decay=weight_decay),
-        "dit": optax.adamw(learning_rate=lr_dit, weight_decay=weight_decay),
-    }
-    tx = optax.multi_transform(tx_config, param_labels)
-
+    tx = optax.adamw(learning_rate=learning_rate, weight_decay=weight_decay)
     opt_state = tx.init(params)
     return TrainStatePmap(
         params=params,
@@ -235,6 +201,9 @@ def train_step_pmap(
     loss_fn: Callable[[Any, Array, PRNGKey], Dict[str, Array]],
     ema_rate: float = 0.999,
     freeze_dit_steps: int = 0,
+    base_lr: float = 1e-4,
+    encoder_lr: Optional[float] = None,
+    dit_lr: Optional[float] = None,
 ):
     """
     Returns a pmapped train step: state, batch, rng -> (state, metrics).
@@ -244,12 +213,22 @@ def train_step_pmap(
         freeze_dit_steps: If > 0, freeze DiT parameters for the first N steps (only train encoder)
     """
 
+    # Compute LR scales (relative to base_lr) for encoder vs DiT
+    enc_scale = (
+        (encoder_lr / base_lr) if (encoder_lr is not None and base_lr > 0) else 1.0
+    )
+    dit_scale = (
+        (dit_lr / base_lr) if (dit_lr is not None and base_lr > 0) else 1.0
+    )
+
     def step(state: TrainStatePmap, batch, rng):
         def loss_wrap(p):
             losses = loss_fn(p, batch, rng)
             return losses["loss"], losses
 
-        (loss, losses), grads = jax.value_and_grad(loss_wrap, has_aux=True)(state.params)
+        (loss, losses), grads = jax.value_and_grad(loss_wrap, has_aux=True)(
+            state.params
+        )
         
         # Freeze DiT for first N steps if enabled
         if freeze_dit_steps > 0:
@@ -271,6 +250,36 @@ def train_step_pmap(
             
             grads = mask_dit_grads(grads)
         
+        # Apply per-module learning rate scaling via gradient scaling
+        def scale_module_grads(grad_dict):
+            if not isinstance(grad_dict, dict):
+                return grad_dict
+
+            new_grads = dict(grad_dict)
+            # Encoder-related params
+            if "encoder" in new_grads:
+                new_grads["encoder"] = jax.tree.map(
+                    lambda g: g * enc_scale, new_grads["encoder"]
+                )
+            if "posterior" in new_grads:
+                new_grads["posterior"] = jax.tree.map(
+                    lambda g: g * enc_scale, new_grads["posterior"]
+                )
+
+            # DiT-related params
+            if "dit" in new_grads:
+                new_grads["dit"] = jax.tree.map(
+                    lambda g: g * dit_scale, new_grads["dit"]
+                )
+            if "time_embed" in new_grads:
+                new_grads["time_embed"] = jax.tree.map(
+                    lambda g: g * dit_scale, new_grads["time_embed"]
+                )
+
+            return new_grads
+
+        grads = scale_module_grads(grads)
+
         updates, new_opt_state = tx.update(grads, state.opt_state, state.params)
         new_params = optax.apply_updates(state.params, updates)
         new_ema_params = _tree_update_ema(state.ema_params, new_params, rate=ema_rate)

@@ -528,18 +528,18 @@ def leave_one_out_c(
             subset_ns_original = ns
         else:
             # Input-independent (LOO): exclude sample i
-            # Cannot use jnp.arange(i), lax.dynamic_slice, jnp.compress, or jnp.sort with traced i
-            # Use jnp.where to create source indices mapping directly
-            
-            # Method: For output position j in [0, ns-2], map to source position:
-            # - If j < i: source = j (take from position j)
-            # - If j >= i: source = j+1 (take from position j+1, skipping i)
-            output_positions = jnp.arange(ns - 1)  # [0, 1, ..., ns-2] - ns-1 is concrete
-            source_indices = jnp.where(output_positions < i, output_positions, output_positions + 1)
-            
-            # Use jnp.take to select elements from batch_set using source_indices
-            # batch_set shape: (b, ns, C, H, W), we want (b, ns-1, C, H, W)
-            x_subset = jnp.take(batch_set, source_indices, axis=1)  # (b, ns-1, C, H, W)
+        # Cannot use jnp.arange(i), lax.dynamic_slice, jnp.compress, or jnp.sort with traced i
+        # Use jnp.where to create source indices mapping directly
+        
+        # Method: For output position j in [0, ns-2], map to source position:
+        # - If j < i: source = j (take from position j)
+        # - If j >= i: source = j+1 (take from position j+1, skipping i)
+        output_positions = jnp.arange(ns - 1)  # [0, 1, ..., ns-2] - ns-1 is concrete
+        source_indices = jnp.where(output_positions < i, output_positions, output_positions + 1)
+        
+        # Use jnp.take to select elements from batch_set using source_indices
+        # batch_set shape: (b, ns, C, H, W), we want (b, ns-1, C, H, W)
+        x_subset = jnp.take(batch_set, source_indices, axis=1)  # (b, ns-1, C, H, W)
             subset_ns_original = ns - 1
         
         # CRITICAL FIX: For sViT with SPT stacking, pad subset back to sample_size
