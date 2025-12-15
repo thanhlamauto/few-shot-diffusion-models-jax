@@ -175,7 +175,8 @@ def create_train_state_pmap(
 
     # Build parameter labels: mark which params use encoder LR vs DiT LR
     def label_subtree(subtree, label: str):
-        return jax.tree_map(lambda _: label, subtree)
+        # NOTE: jax.tree_map is deprecated in JAX >=0.6.0; use jax.tree.map instead.
+        return jax.tree.map(lambda _: label, subtree)
 
     param_labels = {}
     if isinstance(params, dict):
