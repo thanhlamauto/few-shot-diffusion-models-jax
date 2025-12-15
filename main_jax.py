@@ -381,9 +381,33 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
     top_5_names = [(dataset.map_cls.get(cid, f"class_{cid}"), count) for cid, count in top_5]
     print(f"   Top 5 classes: {top_5_names}")
     
-    # Convert to HWC
-    generated_hwc = generated_images.transpose(0, 2, 3, 1)
-    real_hwc = real_images.transpose(0, 2, 3, 1)
+    # Convert to HWC and normalize to [-1, 1] float32
+    generated_hwc = generated_images.transpose(0, 2, 3, 1).astype(np.float32)
+    real_hwc = real_images.transpose(0, 2, 3, 1).astype(np.float32)
+
+    def _to_minus1_1(x: np.ndarray) -> np.ndarray:
+        """
+        Normalize images to [-1, 1] for FID.
+        Handles common cases:
+          - uint8 [0, 255]
+          - float [0, 1]
+          - already roughly in [-1, 1] (no change, just clip)
+        """
+        x = x.astype(np.float32)
+        x_min, x_max = x.min(), x.max()
+
+        # Case 1: uint8 or clearly in [0, 255]
+        if x.dtype == np.uint8 or x_max > 1.5:
+            x = x / 127.5 - 1.0
+        # Case 2: [0, 1] (or very close)
+        elif x_min >= -1e-3 and x_max <= 1.0 + 1e-3:
+            x = x * 2.0 - 1.0
+        # Else: assume already in [-1, 1], just clip a bit
+        x = np.clip(x, -1.0, 1.0)
+        return x
+
+    real_hwc = _to_minus1_1(real_hwc)
+    generated_hwc = _to_minus1_1(generated_hwc)
     
     print(f"\n✅ Final shapes:")
     print(f"   Generated: {generated_hwc.shape}")
