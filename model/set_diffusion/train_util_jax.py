@@ -214,11 +214,28 @@ def train_step_pmap(
     """
 
     # Compute LR scales (relative to base_lr) for encoder vs DiT
+    def _to_float_or_none(x):
+        # Args from argparse may come as strings; normalize here.
+        if x is None:
+            return None
+        if isinstance(x, (float, int)):
+            return float(x)
+        if isinstance(x, str):
+            xs = x.strip()
+            if xs == "" or xs.lower() in ("none", "null"):
+                return None
+            return float(xs)
+        # Fallback: try cast
+        return float(x)
+
+    enc_lr_val = _to_float_or_none(encoder_lr)
+    dit_lr_val = _to_float_or_none(dit_lr)
+
     enc_scale = (
-        (encoder_lr / base_lr) if (encoder_lr is not None and base_lr > 0) else 1.0
+        (enc_lr_val / base_lr) if (enc_lr_val is not None and base_lr > 0) else 1.0
     )
     dit_scale = (
-        (dit_lr / base_lr) if (dit_lr is not None and base_lr > 0) else 1.0
+        (dit_lr_val / base_lr) if (dit_lr_val is not None and base_lr > 0) else 1.0
     )
 
     def step(state: TrainStatePmap, batch, rng):
