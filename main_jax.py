@@ -547,10 +547,18 @@ def main():
 
     # Initialize wandb only if explicitly enabled
     if args.use_wandb:
+        # Set wandb to non-interactive mode (use existing account, no prompts)
+        # This is especially important for Kaggle/automated environments
+        os.environ["WANDB_MODE"] = os.environ.get("WANDB_MODE", "online")
+        # Disable interactive prompts
+        os.environ["WANDB_SILENT"] = "true"
+        
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
             config=vars(args),
+            mode="online",  # Use online mode (requires existing account/auth)
+            # If API key is set via environment variable, wandb will use it automatically
         )
     else:
         # Explicitly disable wandb to avoid any background processes

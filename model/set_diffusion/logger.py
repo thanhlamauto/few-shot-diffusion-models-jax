@@ -519,7 +519,11 @@ def configure(dir=None, format_strs=None, comm=None, log_suffix="", mode="traini
         if mode == "training":
             date = datetime.datetime.now().strftime("run-%Y-%m-%d-%H-%M-%S-%f")
             dir = osp.join(dir, name, date)
-            writer_wb = wandb.init(dir="./", name=name + "-" + date, config=args)
+            # Set wandb to non-interactive mode (use existing account, no prompts)
+            import os
+            os.environ["WANDB_MODE"] = os.environ.get("WANDB_MODE", "online")
+            os.environ["WANDB_SILENT"] = "true"
+            writer_wb = wandb.init(dir="./", name=name + "-" + date, config=args, mode="online")
         elif mode == "sampling":
             dir = osp.join(dir, name, run_date)
         elif mode in ["sampling-conditional", "sampling-conditional-out-distro", "sampling-conditional-in-distro"]:

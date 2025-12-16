@@ -32,7 +32,11 @@ class Logger:
         wb_name = self.args.name + "_" + self.args.timestamp
         if self.args.tag != "": 
             wb_name = wb_name + "_" + self.args.tag 
-        self.writer_wb = wandb.init(dir=self.args.run_dir, name=wb_name, config=self.cfg)
+        # Set wandb to non-interactive mode (use existing account, no prompts)
+        import os
+        os.environ["WANDB_MODE"] = os.environ.get("WANDB_MODE", "online")
+        os.environ["WANDB_SILENT"] = "true"
+        self.writer_wb = wandb.init(dir=self.args.run_dir, name=wb_name, config=self.cfg, mode="online")
 
     def log_grad(self, model):
         self.writer_wb.watch(model, log='all')
