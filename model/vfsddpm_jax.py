@@ -113,6 +113,8 @@ class VFSDDPMConfig:
     # Memory optimization for lag mode
     context_pool_size: int = 0  # If > 0, pool context tokens to this size (reduces Nk, saves memory)
     cross_attn_layers: str = "all"  # "all" or comma-separated layer indices (e.g., "2,3,4,5") to enable cross-attn only at specific layers
+    # Debug / logging
+    debug_metrics: bool = False  # Gate heavy debug reductions in vfsddpm_loss
 
 
 def build_encoder(cfg: VFSDDPMConfig) -> nn.Module:
@@ -504,7 +506,7 @@ def leave_one_out_c(
     # Check if we need tokens for lag mode
     need_tokens = cfg.mode_conditioning == "lag"
     
-    # Pre-allocate arrays for both modes
+    # Pre-allocate arrays for both modes (fixed shapes for all iterations)
     if need_tokens:
         num_patches = (cfg.image_size // cfg.patch_size) ** 2
         init_token_set = jnp.zeros((b, ns, num_patches, cfg.hdim), dtype=jnp.float32)
@@ -515,62 +517,59 @@ def leave_one_out_c(
     
     # Pre-allocate KL list (will be masked later if not variational)
     init_kl_list = jnp.zeros((ns,), dtype=jnp.float32)
-    
-    rngs = jax.random.split(rng, ns)
-    
+
+    # Dummy-slot refactor:
+    # Pad batch_set once with a dummy sample (index ns), and build indices that
+    # either include all real samples (input_dependent=True) or leave-one-out
+    # by redirecting one position to the dummy index.
+    dummy = jnp.zeros_like(batch_set[:, :1])  # (b, 1, C, H, W)
+    batch_set_pad = jnp.concatenate([batch_set, dummy], axis=1)  # (b, ns+1, C, H, W)
+
+    # Build full timestep embedding tensor once, then pad with dummy slot
+    t_emb_full = jnp.repeat(t_emb_set[:, None, :], ns, axis=1)  # (b, ns, hdim)
+    t_dummy = jnp.zeros_like(t_emb_full[:, :1])  # (b, 1, hdim)
+    t_emb_pad = jnp.concatenate([t_emb_full, t_dummy], axis=1)  # (b, ns+1, hdim)
+
+    # Static positions [0, 1, ..., ns-1]
+    pos = jnp.arange(ns)
+
     def body(i, carry):
         """Body function for lax.fori_loop - processes one iteration"""
         token_set_carry, c_list_carry, kl_list_carry = carry
         
+        # Per-iteration RNG derived via fold_in to avoid dynamic indexing
+        key_i = jax.random.fold_in(rng, i)
+
         if cfg.input_dependent:
-            # Input-dependent: use full set including sample i
-            x_subset = batch_set  # (b, ns, C, H, W) - includes all samples
-            subset_ns_original = ns
+            # Input-dependent: use full set including sample i (no dummy)
+            idx = pos  # (ns,)
         else:
-            # Input-independent (LOO): exclude sample i
-            # Cannot use jnp.arange(i), lax.dynamic_slice, jnp.compress, or jnp.sort with traced i
-            # Use jnp.where to create source indices mapping directly
-            
-            # Method: For output position j in [0, ns-2], map to source position:
-            # - If j < i: source = j (take from position j)
-            # - If j >= i: source = j+1 (take from position j+1, skipping i)
-            output_positions = jnp.arange(ns - 1)  # [0, 1, ..., ns-2] - ns-1 is concrete
-            source_indices = jnp.where(output_positions < i, output_positions, output_positions + 1)
-            
-            # Use jnp.take to select elements from batch_set using source_indices
-            # batch_set shape: (b, ns, C, H, W), we want (b, ns-1, C, H, W)
-            x_subset = jnp.take(batch_set, source_indices, axis=1)  # (b, ns-1, C, H, W)
-            subset_ns_original = ns - 1
-        
-        # CRITICAL FIX: For sViT with SPT stacking, pad subset back to sample_size
-        # SPT expects fixed sample_size for patch_dim calculation
-        if cfg.encoder_mode == "vit_set" and x_subset.shape[1] < cfg.sample_size:
-            # Pad with zeros to maintain sample_size
-            pad_size = cfg.sample_size - x_subset.shape[1]
-            pad_images = jnp.zeros((b, pad_size, *x_subset.shape[2:]), dtype=x_subset.dtype)
-            x_subset = jnp.concatenate([x_subset, pad_images], axis=1)  # (b, sample_size, C, H, W)
-            subset_ns = cfg.sample_size
-        else:
-            subset_ns = subset_ns_original
-        
-        # Expand t_emb for this subset: (b, hdim) -> (b * subset_ns, hdim)
-        # If we padded, repeat the last t_emb for padded images
-        t_emb_subset = jnp.repeat(t_emb_set[:, None, :], subset_ns_original, axis=1).reshape(
-            b * subset_ns_original, cfg.hdim
+            # Input-independent (LOO) with dummy slot:
+            # For each position j in [0, ns-1], map to source index:
+            # - If j < i: use j
+            # - If j >= i: use j+1 (skip i, point to either real or dummy at ns)
+            idx = jnp.where(pos < i, pos, pos + 1)  # (ns,), exactly one element == ns
+
+        # Take subset with fixed shape (b, ns, C, H, W)
+        x_subset = jnp.take(batch_set_pad, idx, axis=1)
+
+        # Timestep embedding subset: (b, ns, hdim) -> (b*ns, hdim)
+        t_emb_subset = jnp.take(t_emb_pad, idx, axis=1).reshape(
+            b * ns, cfg.hdim
         )
-        if subset_ns > subset_ns_original:
-            # Pad t_emb to match padded x_subset
-            pad_t_emb = jnp.repeat(t_emb_set[:, None, :], subset_ns - subset_ns_original, axis=1).reshape(
-                b * (subset_ns - subset_ns_original), cfg.hdim
-            )
-            t_emb_subset = jnp.concatenate([t_emb_subset, pad_t_emb], axis=0)  # (b * subset_ns, hdim)
         
         # Encode subset
         if need_tokens:
             # Get both hc and tokens for lag mode
             hc, tokens = encode_set(
-                params["encoder"], enc, x_subset, cfg, train=train,
-                t_emb=t_emb_subset, return_tokens=True, rng=rngs[i]
+                params["encoder"],
+                enc,
+                x_subset,
+                cfg,
+                train=train,
+                t_emb=t_emb_subset,
+                return_tokens=True,
+                rng=key_i,
             )
             # tokens: (b, num_patches, hdim)
             # Update token_set at index i
@@ -578,13 +577,19 @@ def leave_one_out_c(
         else:
             # Only get hc for film mode
             hc = encode_set(
-                params["encoder"], enc, x_subset, cfg, train=train,
-                t_emb=t_emb_subset, return_tokens=False, rng=rngs[i]
+                params["encoder"],
+                enc,
+                x_subset,
+                cfg,
+                train=train,
+                t_emb=t_emb_subset,
+                return_tokens=False,
+                rng=key_i,
             )
         
         # Apply posterior if variational (works on pooled hc ONLY, not tokens)
         # CRITICAL: c_vec is only for KL loss, NOT used for conditioning in lag mode
-        c_vec, klc = sample_context(rngs[i], hc, cfg, posterior, params_post)
+        c_vec, klc = sample_context(key_i, hc, cfg, posterior, params_post)
         
         # Update c_list for film mode
         if not need_tokens:
@@ -745,55 +750,60 @@ def vfsddpm_loss(
         total = total + klc
         losses["klc"] = klc
     losses["loss"] = total
-    # Add debug metrics from context (scalars only, don't store large tensor)
-    # This avoids memory leak from storing large context tensor in lag mode
-    if cfg.mode_conditioning == "lag":
-        # For lag mode: c is (b*ns, num_patches, hdim) - very large!
-        # Only compute scalar metrics, don't store tensor
-        losses["debug/context_norm"] = jnp.linalg.norm(c)
-        losses["debug/context_mean"] = jnp.mean(jnp.abs(c))
-        losses["debug/context_max"] = jnp.max(jnp.abs(c))
-        losses["debug/context_std"] = jnp.std(c)
-    else:
-        # For film mode: c is (b*ns, hdim) - smaller, but still avoid storing
-        losses["debug/context_norm"] = jnp.linalg.norm(c)
-        losses["debug/context_mean"] = jnp.mean(jnp.abs(c))
-    
-    # --- DEBUG LOGGING BLOCK START ---
-    # 1. Input stats
-    losses["debug/data_min"] = jnp.min(batch_set)
-    losses["debug/data_max"] = jnp.max(batch_set)
-    losses["debug/data_mean"] = jnp.mean(batch_set)
-    
-    # 2. Context stats (Encoder output)
-    # c shape: (B*ns, hdim) for film or (B*ns, num_patches, hdim) for lag
-    losses["debug/c_mean"] = jnp.mean(c)
-    losses["debug/c_std"] = jnp.std(c)
-    # Compute norm: mean(sqrt(sum(c^2, axis=-1)))
-    # For film: (b*ns, hdim) -> (b*ns,) -> scalar
-    # For lag: (b*ns, num_patches, hdim) -> (b*ns, num_patches) -> scalar
-    losses["debug/c_norm"] = jnp.mean(jnp.sqrt(jnp.sum(c**2, axis=-1)))
-    
-    # 3. Time embedding stats
-    # Re-compute t_emb for comparison
-    base_dim = cfg.hdim // 4
-    t_base = timestep_embedding_jax(t, base_dim)  # (b, base_dim)
-    t_emb_chk = modules["time_embed"].apply(params["time_embed"], t_base)  # (b, hdim)
-    # Compute norm per sample
-    t_norm_per_sample = jnp.sqrt(jnp.sum(t_emb_chk**2, axis=-1))  # (b,)
-    losses["debug/t_norm"] = jnp.mean(t_norm_per_sample)
-    
-    # 4. Signal Ratio (Quan trọng)
-    # If ratio < 0.01, Encoder quá yếu so với Time Embedding
-    losses["debug/signal_ratio_c_t"] = losses["debug/c_norm"] / (losses["debug/t_norm"] + 1e-6)
-    
-    # 5. Additional magnitude comparisons
-    mag_t = jnp.mean(jnp.abs(t_emb_chk))
-    mag_c = jnp.mean(jnp.abs(c))
-    losses["debug/magnitude_time"] = mag_t
-    losses["debug/magnitude_context"] = mag_c
-    losses["debug/ratio_c_over_t"] = mag_c / (mag_t + 1e-6)
-    # --- DEBUG LOGGING BLOCK END ---
+    # Heavy debug metrics (context/data/timestep stats) are gated to avoid huge
+    # reduction graphs in XLA, especially for lag mode where c is very large.
+    if getattr(cfg, "debug_metrics", False):
+        # Add debug metrics from context (scalars only, don't store large tensor)
+        # This avoids memory leak from storing large context tensor in lag mode
+        if cfg.mode_conditioning == "lag":
+            # For lag mode: c is (b*ns, num_patches, hdim) - very large!
+            # Only compute scalar metrics, don't store tensor
+            losses["debug/context_norm"] = jnp.linalg.norm(c)
+            losses["debug/context_mean"] = jnp.mean(jnp.abs(c))
+            losses["debug/context_max"] = jnp.max(jnp.abs(c))
+            losses["debug/context_std"] = jnp.std(c)
+        else:
+            # For film mode: c is (b*ns, hdim) - smaller, but still avoid storing
+            losses["debug/context_norm"] = jnp.linalg.norm(c)
+            losses["debug/context_mean"] = jnp.mean(jnp.abs(c))
+        
+        # --- DEBUG LOGGING BLOCK START ---
+        # 1. Input stats
+        losses["debug/data_min"] = jnp.min(batch_set)
+        losses["debug/data_max"] = jnp.max(batch_set)
+        losses["debug/data_mean"] = jnp.mean(batch_set)
+        
+        # 2. Context stats (Encoder output)
+        # c shape: (B*ns, hdim) for film or (B*ns, num_patches, hdim) for lag
+        losses["debug/c_mean"] = jnp.mean(c)
+        losses["debug/c_std"] = jnp.std(c)
+        # Compute norm: mean(sqrt(sum(c^2, axis=-1)))
+        # For film: (b*ns, hdim) -> (b*ns,) -> scalar
+        # For lag: (b*ns, num_patches, hdim) -> (b*ns, num_patches) -> scalar
+        losses["debug/c_norm"] = jnp.mean(jnp.sqrt(jnp.sum(c**2, axis=-1)))
+        
+        # 3. Time embedding stats
+        # Re-compute t_emb for comparison
+        base_dim = cfg.hdim // 4
+        t_base = timestep_embedding_jax(t, base_dim)  # (b, base_dim)
+        t_emb_chk = modules["time_embed"].apply(params["time_embed"], t_base)  # (b, hdim)
+        # Compute norm per sample
+        t_norm_per_sample = jnp.sqrt(jnp.sum(t_emb_chk**2, axis=-1))  # (b,)
+        losses["debug/t_norm"] = jnp.mean(t_norm_per_sample)
+        
+        # 4. Signal Ratio (Quan trọng)
+        # If ratio < 0.01, Encoder quá yếu so với Time Embedding
+        losses["debug/signal_ratio_c_t"] = (
+            losses["debug/c_norm"] / (losses["debug/t_norm"] + 1e-6)
+        )
+        
+        # 5. Additional magnitude comparisons
+        mag_t = jnp.mean(jnp.abs(t_emb_chk))
+        mag_c = jnp.mean(jnp.abs(c))
+        losses["debug/magnitude_time"] = mag_t
+        losses["debug/magnitude_context"] = mag_c
+        losses["debug/ratio_c_over_t"] = mag_c / (mag_t + 1e-6)
+        # --- DEBUG LOGGING BLOCK END ---
     
     # Don't store c tensor - it's too large and causes memory leak
     return losses

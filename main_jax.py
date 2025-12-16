@@ -145,7 +145,7 @@ def numpy_from_torch(batch):
     return arr
 
 
-def eval_loop(p_state, modules, cfg, loader, n_devices, num_batches):
+def eval_loop(p_state, modules, cfg, loader, n_devices, num_batches, args):
     """
     Simple eval: run vfsddpm_loss (train=False) on a few batches (host-side).
     Uses EMA params for evaluation.
@@ -161,6 +161,18 @@ def eval_loop(p_state, modules, cfg, loader, n_devices, num_batches):
         except StopIteration:
             break
         batch_np = numpy_from_torch(batch)
+        # CRITICAL: Pad batch to fixed batch_size_eval to avoid recompilation
+        if batch_np.shape[0] < args.batch_size_eval:
+            pad_size = args.batch_size_eval - batch_np.shape[0]
+            pad = np.zeros((pad_size,) + batch_np.shape[1:], dtype=batch_np.dtype)
+            batch_np = np.concatenate([batch_np, pad], axis=0)
+        elif batch_np.shape[0] > args.batch_size_eval:
+            # Crop if larger (shouldn't happen with drop_last, but be safe)
+            batch_np = batch_np[:args.batch_size_eval]
+        # CRITICAL: Normalize to cfg.sample_size before calling vfsddpm_loss
+        # This ensures consistent shapes and prevents JIT recompilation
+        batch_np = fix_set_size(jnp.array(batch_np), cfg.sample_size)
+        batch_np = np.array(batch_np)  # Convert back to numpy for vfsddpm_loss
         # use full batch on host (single device) for eval
         loss_dict = vfsddpm_loss(jax.random.PRNGKey(
             0), params_eval, modules, batch_np, cfg, train=False)
@@ -170,7 +182,7 @@ def eval_loop(p_state, modules, cfg, loader, n_devices, num_batches):
     return float(np.mean(losses))
 
 
-def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta, ddim_num_steps=None):
+def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta, args, ddim_num_steps=None):
     """
     Minimal sampling: use first batches from loader, build conditioning, and run diffusion.
     Saves .npz files with samples/cond and returns samples for logging.
@@ -193,6 +205,14 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta, 
         except StopIteration:
             break
         batch_np = numpy_from_torch(batch)
+        # CRITICAL: Pad/crop batch to fixed batch_size_eval to avoid recompilation
+        if batch_np.shape[0] < args.batch_size_eval:
+            pad_size = args.batch_size_eval - batch_np.shape[0]
+            pad = np.zeros((pad_size,) + batch_np.shape[1:], dtype=batch_np.dtype)
+            batch_np = np.concatenate([batch_np, pad], axis=0)
+        elif batch_np.shape[0] > args.batch_size_eval:
+            # Crop if larger (shouldn't happen with drop_last, but be safe)
+            batch_np = batch_np[:args.batch_size_eval]
         # CRITICAL: Normalize to cfg.sample_size before calling leave_one_out_c
         # This ensures consistent shapes and prevents JIT recompilation
         from model.vfsddpm_jax import fix_set_size
@@ -305,6 +325,7 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
     # Step 3: Generate samples from mixture
     print(f"\n🎨 Generating {n_samples} samples from class mixture...")
     print(f"   Strategy: Random class selection → Sample support set → Generate via leave-one-out")
+    print(f"   Batch accumulation: Processing in batches of {args.batch_size_eval} to avoid recompilation")
     
     ns = cfg.sample_size
     all_generated = []
@@ -316,6 +337,12 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
     
     pbar = tqdm(total=n_samples, desc=f"{dist_name}-dist generation", unit="images")
     
+    # Batch accumulation buffer to avoid bs=1 compilation
+    batch_size_fid = args.batch_size_eval
+    support_buffer = []
+    real_buffer = []
+    class_buffer = []
+    
     generated_count = 0
     while generated_count < n_samples:
         # Randomly select a class (uniform over classes)
@@ -326,22 +353,88 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
         support_indices = np.random.choice(len(class_images), size=ns, replace=True)
         support_set = class_images[support_indices]  # (ns, C, H, W)
         
-        # Generate ns images conditioned on this support set
-        mini_batch = support_set[None, ...]  # (1, ns, C, H, W)
+        # Collect corresponding real images (random from same class)
+        real_indices = np.random.choice(len(class_images), size=ns, replace=True)
+        real_set = class_images[real_indices]  # (ns, C, H, W)
+        
+        # Add to buffers
+        support_buffer.append(support_set)
+        real_buffer.append(real_set)
+        class_buffer.append(selected_class)
+        
+        # Process batch when buffer is full
+        if len(support_buffer) >= batch_size_fid:
+            # Stack support sets into batch: (batch_size_fid, ns, C, H, W)
+            mini_batch = np.stack(support_buffer, axis=0)
+            
+            # CRITICAL: Normalize to cfg.sample_size before calling leave_one_out_c
+            # This ensures consistent shapes and prevents JIT recompilation
+            from model.vfsddpm_jax import fix_set_size
+            mini_batch = fix_set_size(jnp.array(mini_batch), cfg.sample_size)
+            mini_batch = np.array(mini_batch)  # Convert back to numpy
+            
+            sub = {"encoder": ema_params["encoder"],
+                   "posterior": ema_params.get("posterior"),
+                   "time_embed": ema_params.get("time_embed")}
+            rng, cond_rng = jax.random.split(rng)
+            
+            # Create dummy timestep for encoding (encoder needs t for time_embed)
+            # t must have shape (b,) where b is batch size
+            bs = mini_batch.shape[0]
+            t_dummy = jnp.zeros((bs,), dtype=jnp.int32)
+            c_cond, _ = leave_one_out_c(
+                cond_rng, sub, modules, mini_batch, cfg, train=False, t=t_dummy)
+            
+            diffusion = modules["diffusion"]
+            model_apply = modules["dit"].apply
+            # Shape: (batch_size_fid * ns, C, H, W)
+            shape = (bs * ns, C, H, W)
+            
+            rng, sample_rng = jax.random.split(rng)
+            samples = sample_ema(
+                sample_rng, ema_params["dit"], diffusion, model_apply,
+                shape, conditioning=c_cond, use_ddim=use_ddim, eta=eta,
+                ddim_num_steps=ddim_num_steps
+            )
+            
+            # Reshape samples back to (batch_size_fid, ns, C, H, W) and split
+            samples_np = np.array(samples)  # (batch_size_fid * ns, C, H, W)
+            samples_np = samples_np.reshape(bs, ns, C, H, W)
+            
+            for i in range(bs):
+                all_generated.append(samples_np[i])  # (ns, C, H, W)
+                all_real_for_fid.append(real_buffer[i])
+                class_usage[class_buffer[i]] += ns
+                generated_count += ns
+                pbar.update(ns)
+            
+            # Clear buffers
+            support_buffer = []
+            real_buffer = []
+            class_buffer = []
+    
+    # Process remaining items in buffer if any
+    if len(support_buffer) > 0:
+        # Pad buffer to batch_size_fid if needed (for consistent compilation)
+        while len(support_buffer) < batch_size_fid:
+            # Duplicate last item to pad
+            support_buffer.append(support_buffer[-1])
+            real_buffer.append(real_buffer[-1])
+            class_buffer.append(class_buffer[-1])
+        
+        # Stack support sets into batch: (batch_size_fid, ns, C, H, W)
+        mini_batch = np.stack(support_buffer, axis=0)
         
         # CRITICAL: Normalize to cfg.sample_size before calling leave_one_out_c
-        # This ensures consistent shapes and prevents JIT recompilation
         from model.vfsddpm_jax import fix_set_size
         mini_batch = fix_set_size(jnp.array(mini_batch), cfg.sample_size)
-        mini_batch = np.array(mini_batch)  # Convert back to numpy
+        mini_batch = np.array(mini_batch)
         
         sub = {"encoder": ema_params["encoder"],
                "posterior": ema_params.get("posterior"),
                "time_embed": ema_params.get("time_embed")}
         rng, cond_rng = jax.random.split(rng)
         
-        # Create dummy timestep for encoding (encoder needs t for time_embed)
-        # t must have shape (b,) where b is batch size
         bs = mini_batch.shape[0]
         t_dummy = jnp.zeros((bs,), dtype=jnp.int32)
         c_cond, _ = leave_one_out_c(
@@ -349,7 +442,7 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
         
         diffusion = modules["diffusion"]
         model_apply = modules["dit"].apply
-        shape = (ns, C, H, W)
+        shape = (bs * ns, C, H, W)
         
         rng, sample_rng = jax.random.split(rng)
         samples = sample_ema(
@@ -358,15 +451,19 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
             ddim_num_steps=ddim_num_steps
         )
         
-        all_generated.append(np.array(samples))
+        # Reshape and only take the items we actually need
+        samples_np = np.array(samples)  # (bs * ns, C, H, W)
+        samples_np = samples_np.reshape(bs, ns, C, H, W)
         
-        # Collect corresponding real images (random from same class)
-        real_indices = np.random.choice(len(class_images), size=ns, replace=True)
-        all_real_for_fid.append(class_images[real_indices])
-        
-        class_usage[selected_class] += ns
-        generated_count += ns
-        pbar.update(ns)
+        original_buffer_size = len(support_buffer) - (batch_size_fid - len(support_buffer))
+        for i in range(original_buffer_size):
+            if generated_count >= n_samples:
+                break
+            all_generated.append(samples_np[i])  # (ns, C, H, W)
+            all_real_for_fid.append(real_buffer[i])
+            class_usage[class_buffer[i]] += ns
+            generated_count += ns
+            pbar.update(ns)
     
     pbar.close()
     
@@ -487,7 +584,9 @@ def main():
 
     # Data loaders (PyTorch) on CPU - load BEFORE model init to check dataset memory
     print(f"📂 Loading datasets...")
-    train_loader = create_loader(args, split="train", shuffle=True)
+    # Use drop_last=True for training loader to keep batch size fixed and avoid
+    # JAX recompilation on the last (smaller) batch.
+    train_loader = create_loader(args, split="train", shuffle=True, drop_last=True)
     val_loader = create_loader(args, split="val", shuffle=False)
     val_dataset = select_dataset(args, split="val")
     print(f"RSS after dataset: {rss_gb():.2f} GB")
@@ -890,6 +989,37 @@ def main():
         print("="*70 + "\n")
         return
     
+    # Warmup compilation: pre-compile training step before training loop
+    print(f"\n{'='*70}")
+    print(f"🔧 Warmup compilation (pre-compile training step)...")
+    print(f"{'='*70}")
+    logger.log("🔄 Compiling training step (warmup)...")
+    logger.log("   This may take 2-10 minutes depending on model complexity.")
+    logger.log("   CPU/GPU usage should be high during compilation.\n")
+    
+    # Create dummy batch with exact training shape
+    dummy_batch_shape = (args.batch_size, cfg.sample_size, cfg.in_channels, cfg.image_size, cfg.image_size)
+    dummy_batch = jnp.zeros(dummy_batch_shape, dtype=jnp.float32)
+    
+    if use_single_device:
+        dummy_batch_sharded = dummy_batch
+        dummy_rngs = jax.random.PRNGKey(0)
+    else:
+        # Shard dummy batch across devices
+        per_device_bs = args.batch_size // n_devices
+        dummy_batch_sharded = jax.device_put_sharded(
+            [dummy_batch[i*per_device_bs:(i+1)*per_device_bs] for i in range(n_devices)],
+            jax.local_devices()
+        )
+        dummy_rngs = jax.random.split(jax.random.PRNGKey(0), n_devices)
+    
+    # Trigger compilation
+    print(f"RSS before warmup compile: {rss_gb():.2f} GB")
+    p_state, _ = p_train_step(p_state, dummy_batch_sharded, dummy_rngs)
+    print(f"RSS after warmup compile: {rss_gb():.2f} GB")
+    logger.log("✅ Warmup compilation complete! Training will start immediately.\n")
+    print(f"{'='*70}\n")
+    
     try:
         for epoch in range(10**6):  # effectively infinite unless steps reached
             pbar = tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch")
@@ -898,21 +1028,25 @@ def main():
                 
                 # CRITICAL: Normalize batch to cfg.sample_size BEFORE train_step
                 # This ensures JAX only compiles ONE version (not multiple for different ns)
-                # Must be done BEFORE sharding to ensure consistent shape
-                batch_np_fixed = fix_set_size(jnp.array(batch_np), cfg.sample_size)
-                batch_np_fixed = np.array(batch_np_fixed)  # Convert back to numpy for sharding
+                # Keep as jnp for efficient device transfer
+                batch_jnp = fix_set_size(jnp.array(batch_np), cfg.sample_size)
                 
                 if use_single_device:
                     # Single device: no sharding needed
-                    batch_sharded = batch_np_fixed
+                    batch_sharded = batch_jnp
                     rng, step_rng = jax.random.split(rng)
                     step_rngs = step_rng  # Single RNG key, not array
                 else:
-                    try:
-                        batch_sharded = shard_batch(batch_np_fixed, n_devices)
-                    except AssertionError:
+                    # Check batch size divisibility
+                    if batch_jnp.shape[0] % n_devices != 0:
                         # skip incomplete batch
                         continue
+                    # Shard using device_put_sharded (more efficient than numpy reshape)
+                    per_device_bs = batch_jnp.shape[0] // n_devices
+                    batch_sharded = jax.device_put_sharded(
+                        [batch_jnp[i*per_device_bs:(i+1)*per_device_bs] for i in range(n_devices)],
+                        jax.local_devices()
+                    )
                     rng, step_rng = jax.random.split(rng)
                     step_rngs = jax.random.split(step_rng, n_devices)
 
@@ -960,11 +1094,15 @@ def main():
                     logger.log(f"{'='*70}")
                     logger.log(f"Batch (original from dataset): {batch_np.shape}")
                     logger.log(f"  → (bs={batch_np.shape[0]}, ns={batch_np.shape[1]}, C={batch_np.shape[2]}, H={batch_np.shape[3]}, W={batch_np.shape[4]})")
-                    logger.log(f"Batch (after fix_set_size): {batch_np_fixed.shape}")
-                    logger.log(f"  → (bs={batch_np_fixed.shape[0]}, ns={batch_np_fixed.shape[1]}, C={batch_np_fixed.shape[2]}, H={batch_np_fixed.shape[3]}, W={batch_np_fixed.shape[4]})")
+                    logger.log(f"Batch (after fix_set_size): {batch_jnp.shape}")
+                    logger.log(f"  → (bs={batch_jnp.shape[0]}, ns={batch_jnp.shape[1]}, C={batch_jnp.shape[2]}, H={batch_jnp.shape[3]}, W={batch_jnp.shape[4]})")
                     logger.log(f"  → ✅ Normalized to cfg.sample_size={cfg.sample_size}")
-                    logger.log(f"Batch (after shard):  {batch_sharded.shape}")
-                    logger.log(f"  → n_devices={n_devices}, per_device_bs={batch_sharded.shape[1] if len(batch_sharded.shape) > 1 else 'N/A'}")
+                    if use_single_device:
+                        logger.log(f"Batch (after shard):  {batch_sharded.shape}")
+                        logger.log(f"  → Single device mode")
+                    else:
+                        logger.log(f"Batch (after shard):  {batch_sharded.shape}")
+                        logger.log(f"  → n_devices={n_devices}, per_device_bs={batch_sharded.shape[1] if len(batch_sharded.shape) > 1 else 'N/A'}")
                     logger.log(f"\nMetrics:")
                     for k, v in metrics_host.items():
                         if isinstance(v, (int, float, np.number)):
@@ -1075,13 +1213,13 @@ def main():
                 if args.save_interval and global_step % args.save_interval == 0:
                     save_checkpoint(global_step, rng)
                     eval_loss = eval_loop(
-                        p_state, modules, cfg, val_loader, n_devices, args.num_eval_batches)
+                        p_state, modules, cfg, val_loader, n_devices, args.num_eval_batches, args)
                     logger.logkv("eval_loss", eval_loss)
                     logger.dumpkvs(global_step)
 
                     # Generate samples and log to wandb
                     samples, support = sample_loop(
-                        p_state, modules, cfg, val_loader, args.num_sample_batches, rng, args.use_ddim, args.eta,
+                        p_state, modules, cfg, val_loader, args.num_sample_batches, rng, args.use_ddim, args.eta, args,
                         ddim_num_steps=args.ddim_num_steps)
 
                     # Initialize log_dict (will be used for both wandb and non-wandb cases)
@@ -1333,6 +1471,8 @@ def create_argparser():
         # Memory optimization for lag mode
         context_pool_size=0,  # If > 0, pool context tokens to this size (reduces Nk, saves memory)
         cross_attn_layers="all",  # "all" or comma-separated layer indices (e.g., "2,3,4,5")
+        # Debug / logging
+        debug_metrics=False,  # Gate heavy debug reductions in vfsddpm_loss
     ) 
     defaults.update(model_and_diffusion_defaults_jax())
     parser = argparse.ArgumentParser()
