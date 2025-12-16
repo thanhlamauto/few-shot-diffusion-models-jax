@@ -211,9 +211,21 @@ class DiTBlock(nn.Module):
         use_cross_attn = (self.mode_conditioning == "lag" and context is not None)
         
         if use_adaln:
+            # Normalize context with LayerNorm and apply learnable scale
+            # 1. Normalize context to mean=0, std=1
+            c_norm = nn.LayerNorm(use_bias=False, use_scale=False)(c)
+            # 2. Apply learnable scale parameter (per-dimension scale)
+            context_scale = self.param(
+                'context_scale',
+                nn.initializers.ones_init(),
+                (self.hidden_size,)  # Per-dimension scale matching hidden_size
+            )
+            c_final = c_norm * context_scale
+            
             # adaLN modulation params (only for film mode)
             # AdaLN-Zero: initialize with 0
-            c_mod = nn.silu(c)
+            # Use normalized and scaled context
+            c_mod = nn.silu(c_final)
             c_mod = nn.Dense(
                 6 * self.hidden_size, kernel_init=nn.initializers.constant(0), bias_init=nn.initializers.constant(0)
             )(c_mod)
@@ -251,9 +263,24 @@ class DiTBlock(nn.Module):
         # Cross-attention (only for lag mode, no AdaLN)
         if use_cross_attn:
             x_norm_cross = nn.LayerNorm(use_bias=False, use_scale=False)(x)
+            
+            # Normalize context with LayerNorm and apply learnable scale
+            # 1. Normalize context to mean=0, std=1
+            # Handle both 2D (B, hidden_size) and 3D (B, N, hidden_size) cases
+            context_norm = nn.LayerNorm(use_bias=False, use_scale=False)(context)
+            # 2. Apply learnable scale parameter (per-dimension scale)
+            # For lag mode, context_channels might be different from hidden_size
+            # Use context_channels for the scale parameter shape
+            context_scale = self.param(
+                'context_scale_lag',
+                nn.initializers.ones_init(),
+                (self.context_channels,)  # Per-dimension scale matching context_channels
+            )
+            context_final = context_norm * context_scale
+            
             context_proj = nn.Dense(
                 self.hidden_size, kernel_init=nn.initializers.xavier_uniform()
-            )(context)
+            )(context_final)
             cross_attn_x = nn.MultiHeadDotProductAttention(
                 kernel_init=nn.initializers.xavier_uniform(), num_heads=self.num_heads
             )(x_norm_cross, context_proj, context_proj)
