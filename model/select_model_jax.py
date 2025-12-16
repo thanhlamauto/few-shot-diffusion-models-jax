@@ -46,6 +46,7 @@ def select_model_jax(args, rng: jax.Array) -> Tuple[Dict[str, Any], Dict[str, An
         input_dependent=getattr(args, "input_dependent", False),
         context_pool_size=getattr(args, "context_pool_size", 0),
         cross_attn_layers=getattr(args, "cross_attn_layers", "all"),
+        use_context_layernorm=getattr(args, "use_context_layernorm", True),
     )
     params, modules = init_models(rng, cfg)
     return params, modules, cfg

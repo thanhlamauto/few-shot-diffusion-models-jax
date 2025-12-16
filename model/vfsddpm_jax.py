@@ -115,6 +115,8 @@ class VFSDDPMConfig:
     cross_attn_layers: str = "all"  # "all" or comma-separated layer indices (e.g., "2,3,4,5") to enable cross-attn only at specific layers
     # Debug / logging
     debug_metrics: bool = False  # Gate heavy debug reductions in vfsddpm_loss
+    # Context LayerNorm control for lag mode cross-attention
+    use_context_layernorm: bool = True
 
 
 def build_encoder(cfg: VFSDDPMConfig) -> nn.Module:
@@ -205,6 +207,7 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
         patch_size=cfg.patch_size,
         dropout=cfg.dropout,
         cross_attn_layers=getattr(cfg, "cross_attn_layers", "all"),
+        use_context_layernorm=getattr(cfg, "use_context_layernorm", True),
         diffusion_steps=cfg.diffusion_steps,
         noise_schedule=cfg.noise_schedule,
         timestep_respacing=cfg.timestep_respacing,

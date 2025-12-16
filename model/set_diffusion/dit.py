@@ -52,12 +52,13 @@ def modulate(x, shift, scale):
 
 class DiTBlock(nn.Module):
     """DiT block with adaLN-Zero conditioning"""
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, context_channels=0, mode_conditioning="film"):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, context_channels=0, mode_conditioning="film", use_context_layernorm=True):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
         self.mode_conditioning = mode_conditioning
+        self.use_context_layernorm = use_context_layernorm
         
         # Self-attention
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -117,6 +118,13 @@ class DiTBlock(nn.Module):
         if self.mode_conditioning == "lag" and c is not None:
             x_norm_cross = self.norm_cross(x)
             c_proj = self.context_proj(c)  # (B, N_c, hidden_size) or (B, hidden_size)
+            # Optional LayerNorm over context tokens before cross-attention
+            if self.use_context_layernorm:
+                # Handle both 2D and 3D context: apply LayerNorm over last dim
+                context_norm = nn.functional.layer_norm(
+                    c_proj, c_proj.shape[-1:], eps=1e-6
+                )
+                c_proj = context_norm
             if c_proj.dim() == 2:
                 c_proj = c_proj.unsqueeze(1)  # (B, 1, hidden_size)
             cross_out, _ = self.cross_attn(x_norm_cross, c_proj, c_proj)
@@ -243,7 +251,7 @@ class DiTModel(nn.Module):
                 num_heads=num_heads,
                 mlp_ratio=mlp_ratio,
                 context_channels=context_channels if mode_conditioning == "lag" else 0,
-                mode_conditioning=mode_conditioning
+                mode_conditioning=mode_conditioning,
             )
             for _ in range(self.depth)
         ])

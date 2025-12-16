@@ -203,6 +203,7 @@ class DiTBlock(nn.Module):
     context_channels: int = 0
     mode_conditioning: str = "film"  # "film" (AdaLN only) or "lag" (cross-attn only)
     dropout_rate: float = 0.0
+    use_context_layernorm: bool = True
 
     @nn.compact
     def __call__(self, x, c, context=None, train: bool = False):
@@ -211,23 +212,28 @@ class DiTBlock(nn.Module):
         use_cross_attn = (self.mode_conditioning == "lag" and context is not None)
         
         if use_adaln:
-            # Normalize context with LayerNorm and apply learnable scale
-            # 1. Normalize context to mean=0, std=1
-            c_norm = nn.LayerNorm(use_bias=False, use_scale=False)(c)
-            # 2. Apply learnable scale parameter (per-dimension scale)
-            context_scale = self.param(
-                'context_scale',
-                nn.initializers.ones_init(),
-                (self.hidden_size,)  # Per-dimension scale matching hidden_size
-            )
-            c_final = c_norm * context_scale
-            
+            # Tùy chọn dùng / không dùng LayerNorm + scale cho context (film mode)
+            if self.use_context_layernorm:
+                # 1) LayerNorm: chuẩn hóa về mean=0, std=1
+                c_norm = nn.LayerNorm(use_bias=False, use_scale=False)(c)
+                # 2) Learnable scale per-dim
+                context_scale = self.param(
+                    "context_scale",
+                    nn.initializers.ones_init(),
+                    (self.hidden_size,),  # Per-dimension scale matching hidden_size
+                )
+                c_used = c_norm * context_scale
+            else:
+                # Không dùng LayerNorm + scale: dùng context raw
+                c_used = c
+
             # adaLN modulation params (only for film mode)
-            # AdaLN-Zero: initialize with 0
-            # Use normalized and scaled context
-            c_mod = nn.silu(c_final)
+            # AdaLN-Zero: initialize với 0
+            c_mod = nn.silu(c_used)
             c_mod = nn.Dense(
-                6 * self.hidden_size, kernel_init=nn.initializers.constant(0), bias_init=nn.initializers.constant(0)
+                6 * self.hidden_size,
+                kernel_init=nn.initializers.constant(0),
+                bias_init=nn.initializers.constant(0),
             )(c_mod)
             (
                 shift_msa,
@@ -245,38 +251,32 @@ class DiTBlock(nn.Module):
                 kernel_init=nn.initializers.xavier_uniform(), num_heads=self.num_heads
             )(x_modulated, x_modulated)
             attn_x = gate_msa[:, None] * attn_x
-            # Apply dropout to self-attention output
             if self.dropout_rate > 0:
                 attn_x = nn.Dropout(self.dropout_rate)(attn_x, deterministic=not train)
             x = x + attn_x
-        else:
-            # Standard self-attention without AdaLN (for lag mode)
-            x_norm = nn.LayerNorm(use_bias=False, use_scale=False)(x)
-            attn_x = nn.MultiHeadDotProductAttention(
-                kernel_init=nn.initializers.xavier_uniform(), num_heads=self.num_heads
-            )(x_norm, x_norm)
-            # Apply dropout to self-attention output
-            if self.dropout_rate > 0:
-                attn_x = nn.Dropout(self.dropout_rate)(attn_x, deterministic=not train)
-            x = x + attn_x
+
 
         # Cross-attention (only for lag mode, no AdaLN)
         if use_cross_attn:
             x_norm_cross = nn.LayerNorm(use_bias=False, use_scale=False)(x)
             
-            # Normalize context with LayerNorm and apply learnable scale
-            # 1. Normalize context to mean=0, std=1
+            # Optionally normalize context with LayerNorm and apply learnable scale
+            # 1. (Optional) Normalize context to mean=0, std=1
             # Handle both 2D (B, hidden_size) and 3D (B, N, hidden_size) cases
-            context_norm = nn.LayerNorm(use_bias=False, use_scale=False)(context)
-            # 2. Apply learnable scale parameter (per-dimension scale)
-            # For lag mode, context_channels might be different from hidden_size
-            # Use context_channels for the scale parameter shape
-            context_scale = self.param(
-                'context_scale_lag',
-                nn.initializers.ones_init(),
-                (self.context_channels,)  # Per-dimension scale matching context_channels
-            )
-            context_final = context_norm * context_scale
+            if self.use_context_layernorm:
+                context_norm = nn.LayerNorm(use_bias=False, use_scale=False)(context)
+                # 2. Apply learnable scale parameter (per-dimension scale)
+                # For lag mode, context_channels might be different from hidden_size
+                # Use context_channels for the scale parameter shape
+                context_scale = self.param(
+                    'context_scale_lag',
+                    nn.initializers.ones_init(),
+                    (self.context_channels,),  # Per-dimension scale matching context_channels
+                )
+                context_final = context_norm * context_scale
+            else:
+                # No LayerNorm or learnable scale on context
+                context_final = context
             
             context_proj = nn.Dense(
                 self.hidden_size, kernel_init=nn.initializers.xavier_uniform()
@@ -360,6 +360,7 @@ class DiT(nn.Module):
     mode_conditioning: str = "film"  # "film" or "lag"
     dropout_rate: float = 0.0
     cross_attn_layers: str = "all"  # "all" or comma-separated layer indices (e.g., "2,3,4,5")
+    use_context_layernorm: bool = True
 
     @nn.compact
     def __call__(self, x, t, c=None, y=None, train=False, force_drop_ids=None):
@@ -442,6 +443,7 @@ class DiT(nn.Module):
                     self.context_channels,
                     self.mode_conditioning,
                     dropout_rate=self.dropout_rate,
+                    use_context_layernorm=self.use_context_layernorm,
                 )(x, conditioning, context=c, train=train)
             else:
                 x = BlockClass(
@@ -451,6 +453,7 @@ class DiT(nn.Module):
                     self.context_channels,
                     self.mode_conditioning,
                     dropout_rate=self.dropout_rate,
+                    use_context_layernorm=self.use_context_layernorm,
                 )(x, conditioning, train=train)
 
         x = FinalLayer(
