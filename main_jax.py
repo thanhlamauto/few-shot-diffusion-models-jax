@@ -1005,18 +1005,26 @@ def main():
     logger.log("   This may take 2-10 minutes depending on model complexity.")
     logger.log("   CPU/GPU usage should be high during compilation.\n")
     
-    # Create dummy batch with exact training shape
+    # Create dummy batch with exact training shape - go through SAME pipeline as real batches
+    # This ensures identical compilation graph and prevents recompilation at step 0
     dummy_batch_shape = (args.batch_size, cfg.sample_size, cfg.in_channels, cfg.image_size, cfg.image_size)
-    dummy_batch = jnp.zeros(dummy_batch_shape, dtype=jnp.float32)
+    # Start with numpy (like numpy_from_torch output)
+    dummy_batch_np = np.zeros(dummy_batch_shape, dtype=np.float32)
+    # Go through fix_set_size (same as real batches)
+    dummy_batch_jnp = fix_set_size(jnp.array(dummy_batch_np), cfg.sample_size)
     
     if use_single_device:
-        dummy_batch_sharded = dummy_batch
+        # Single device: no sharding needed
+        dummy_batch_sharded = dummy_batch_jnp
         dummy_rngs = jax.random.PRNGKey(0)
     else:
-        # Shard dummy batch across devices
-        per_device_bs = args.batch_size // n_devices
+        # Check batch size divisibility (same check as real batches)
+        if dummy_batch_jnp.shape[0] % n_devices != 0:
+            raise ValueError(f"Warmup batch size {dummy_batch_jnp.shape[0]} must be divisible by n_devices {n_devices}")
+        # Shard using device_put_sharded (same as real batches)
+        per_device_bs = dummy_batch_jnp.shape[0] // n_devices
         dummy_batch_sharded = jax.device_put_sharded(
-            [dummy_batch[i*per_device_bs:(i+1)*per_device_bs] for i in range(n_devices)],
+            [dummy_batch_jnp[i*per_device_bs:(i+1)*per_device_bs] for i in range(n_devices)],
             jax.local_devices()
         )
         dummy_rngs = jax.random.split(jax.random.PRNGKey(0), n_devices)
@@ -1058,19 +1066,16 @@ def main():
                     rng, step_rng = jax.random.split(rng)
                     step_rngs = jax.random.split(step_rng, n_devices)
 
-                # First step triggers JIT compilation - this can take several minutes
+                # Step 0 should already be compiled from warmup, so it should run fast
                 if global_step == 0:
-                    logger.log("🔄 Compiling training step (first time only)...")
-                    logger.log("   This may take 2-10 minutes depending on model complexity.")
-                    logger.log("   CPU/GPU usage should be high during compilation.\n")
-                    print(f"RSS before first step (JIT compile): {rss_gb():.2f} GB")
+                    print(f"RSS before first step: {rss_gb():.2f} GB")
                 
                 p_state, metrics = p_train_step(p_state, batch_sharded, step_rngs)
                 
                 if global_step == 0:
-                    print(f"RSS after first step (JIT compile done): {rss_gb():.2f} GB")
+                    print(f"RSS after first step: {rss_gb():.2f} GB")
                     print(f"{'='*70}\n")
-                    logger.log("✅ Compilation complete! Training starting...\n")
+                    logger.log("✅ First training step completed (already compiled during warmup).\n")
 
                 # host metrics
                 if use_single_device:
