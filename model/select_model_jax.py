@@ -47,6 +47,9 @@ def select_model_jax(args, rng: jax.Array) -> Tuple[Dict[str, Any], Dict[str, An
         context_pool_size=getattr(args, "context_pool_size", 0),
         cross_attn_layers=getattr(args, "cross_attn_layers", "all"),
         use_context_layernorm=getattr(args, "use_context_layernorm", True),
+        # Gate heavy debug reductions inside vfsddpm_loss.
+        # This lets you turn on detailed context/time stats from CLI/main_jax.
+        debug_metrics=getattr(args, "debug_metrics", False),
     )
     params, modules = init_models(rng, cfg)
     return params, modules, cfg
