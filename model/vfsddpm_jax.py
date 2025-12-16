@@ -803,6 +803,114 @@ def vfsddpm_loss(
         losses["debug/magnitude_time"] = mag_t
         losses["debug/magnitude_context"] = mag_c
         losses["debug/ratio_c_over_t"] = mag_c / (mag_t + 1e-6)
+        
+        # 6. Context after LayerNorm (simulate what happens in DiTBlock)
+        # Compute c_norm after LayerNorm (same as DiTBlock)
+        if cfg.mode_conditioning == "film":
+            # For film mode: c is (b*ns, hdim)
+            # Simulate LayerNorm: normalize to mean=0, std=1
+            c_mean = jnp.mean(c, axis=-1, keepdims=True)  # (b*ns, 1)
+            c_std = jnp.std(c, axis=-1, keepdims=True)  # (b*ns, 1)
+            c_norm = (c - c_mean) / (c_std + 1e-6)
+            
+            # Expand t_emb to match c shape: (b, hdim) -> (b*ns, hdim)
+            t_emb_expanded = jnp.repeat(t_emb_chk, ns, axis=0)  # (b*ns, hdim)
+            
+            # Compute norms after layer norm
+            c_norm_norm = jnp.mean(jnp.sqrt(jnp.sum(c_norm**2, axis=-1)))  # scalar
+            t_emb_norm = jnp.mean(jnp.sqrt(jnp.sum(t_emb_expanded**2, axis=-1)))  # scalar
+            
+            # Ratio: c_norm / t_emb (after layer norm)
+            losses["debug/c_norm_after_ln"] = c_norm_norm
+            losses["debug/t_norm_for_ratio"] = t_emb_norm
+            losses["debug/ratio_c_norm_t"] = c_norm_norm / (t_emb_norm + 1e-6)
+            
+            # Magnitude ratio after layer norm
+            c_norm_mag = jnp.mean(jnp.abs(c_norm))
+            t_emb_mag = jnp.mean(jnp.abs(t_emb_expanded))
+            losses["debug/magnitude_c_norm"] = c_norm_mag
+            losses["debug/magnitude_t_emb"] = t_emb_mag
+            losses["debug/ratio_mag_c_norm_t"] = c_norm_mag / (t_emb_mag + 1e-6)
+            
+            # Context norm std (should be ~1.0 after LayerNorm)
+            c_norm_std = jnp.std(c_norm, axis=-1)  # (b*ns,)
+            losses["debug/c_norm_std"] = jnp.mean(c_norm_std)  # Should be close to 1.0
+            
+        elif cfg.mode_conditioning == "lag":
+            # For lag mode: c is (b*ns, num_patches, hdim)
+            # Normalize per token (along last dimension)
+            c_mean = jnp.mean(c, axis=-1, keepdims=True)  # (b*ns, num_patches, 1)
+            c_std = jnp.std(c, axis=-1, keepdims=True)
+            c_norm = (c - c_mean) / (c_std + 1e-6)
+            
+            # Expand t_emb: (b, hdim) -> (b*ns, hdim)
+            t_emb_expanded = jnp.repeat(t_emb_chk, ns, axis=0)  # (b*ns, hdim)
+            
+            # For lag mode, compare per-token norm with t_emb
+            c_norm_per_token = jnp.sqrt(jnp.sum(c_norm**2, axis=-1))  # (b*ns, num_patches)
+            c_norm_norm = jnp.mean(c_norm_per_token)  # scalar
+            t_emb_norm = jnp.mean(jnp.sqrt(jnp.sum(t_emb_expanded**2, axis=-1)))  # scalar
+            
+            losses["debug/c_norm_after_ln"] = c_norm_norm
+            losses["debug/t_norm_for_ratio"] = t_emb_norm
+            losses["debug/ratio_c_norm_t"] = c_norm_norm / (t_emb_norm + 1e-6)
+            
+            # Context norm std (should be ~1.0 after LayerNorm)
+            c_norm_std = jnp.std(c_norm, axis=-1)  # (b*ns, num_patches)
+            losses["debug/c_norm_std"] = jnp.mean(c_norm_std)  # Should be close to 1.0
+        
+        # 7. Log context_scale parameters from DiT blocks
+        # Extract context_scale from DiT params (if available)
+        try:
+            dit_params = params.get("dit", {})
+            if dit_params:
+                # DiT params structure: blocks are in a list or dict
+                # We need to extract context_scale from each block
+                # Flax stores params as nested dict, blocks might be in 'blocks' or similar
+                def extract_context_scale(tree, prefix=""):
+                    """Recursively extract context_scale parameters"""
+                    scales = []
+                    if isinstance(tree, dict):
+                        for key, value in tree.items():
+                            if key == "context_scale" or key == "context_scale_lag":
+                                # Found a context_scale parameter
+                                if hasattr(value, 'shape'):  # It's a JAX array
+                                    scales.append(value)
+                                elif isinstance(value, dict) and 'params' in value:
+                                    # Flax param structure: {'params': {...}, 'params_axes': {...}}
+                                    scales.append(value['params'])
+                            else:
+                                scales.extend(extract_context_scale(value, f"{prefix}/{key}" if prefix else key))
+                    elif isinstance(tree, (list, tuple)):
+                        for i, item in enumerate(tree):
+                            scales.extend(extract_context_scale(item, f"{prefix}[{i}]"))
+                    return scales
+                
+                context_scales = extract_context_scale(dit_params)
+                if context_scales:
+                    # Aggregate all context_scale values
+                    # Flatten each scale array and concatenate
+                    all_scales_list = []
+                    for scale in context_scales:
+                        if hasattr(scale, 'shape'):  # JAX array
+                            all_scales_list.append(jnp.ravel(scale))
+                        elif isinstance(scale, dict):
+                            # Handle nested dict structure
+                            for v in scale.values():
+                                if hasattr(v, 'shape'):
+                                    all_scales_list.append(jnp.ravel(v))
+                    
+                    if all_scales_list:
+                        all_scales = jnp.concatenate(all_scales_list)
+                        losses["debug/context_scale_mean"] = jnp.mean(all_scales)
+                        losses["debug/context_scale_std"] = jnp.std(all_scales)
+                        losses["debug/context_scale_min"] = jnp.min(all_scales)
+                        losses["debug/context_scale_max"] = jnp.max(all_scales)
+        except Exception as e:
+            # If extraction fails, skip (params structure might be different)
+            # Don't log error to avoid cluttering output
+            pass
+        
         # --- DEBUG LOGGING BLOCK END ---
     
     # Don't store c tensor - it's too large and causes memory leak

@@ -267,6 +267,24 @@ def train_step_pmap(
             
             grads = mask_dit_grads(grads)
         
+        # Compute RAW grad norms BEFORE scaling (for comparison)
+        def get_norm(tree):
+            """Helper to compute L2 norm of all leaves in a tree"""
+            leaves = jax.tree_util.tree_leaves(tree)
+            return jnp.sqrt(sum(jnp.sum(g**2) for g in leaves if g is not None))
+        
+        raw_grad_norm_dit = None
+        raw_grad_norm_encoder = None
+        if hasattr(grads, 'keys'):
+            for key in ['dit', 'encoder']:
+                if key in grads and grads[key] is not None:
+                    grad_tree = grads[key]
+                    raw_grad_norm = get_norm(grad_tree)
+                    if key == 'dit':
+                        raw_grad_norm_dit = raw_grad_norm
+                    elif key == 'encoder':
+                        raw_grad_norm_encoder = raw_grad_norm
+        
         # Apply per-module learning rate scaling via gradient scaling
         def scale_module_grads(grad_dict):
             if not isinstance(grad_dict, dict):
@@ -326,14 +344,9 @@ def train_step_pmap(
         if "debug/context_std" in losses:
             metrics["debug/context_std"] = losses["debug/context_std"]
         
-        # 2. Gradient norms (layer-wise)
-        def get_norm(tree):
-            """Helper to compute L2 norm of all leaves in a tree"""
-            leaves = jax.tree_util.tree_leaves(tree)
-            return jnp.sqrt(sum(jnp.sum(g**2) for g in leaves if g is not None))
-        
+        # 2. Gradient norms (layer-wise) - AFTER scaling
         if hasattr(grads, 'keys'):
-            # Compute gradient norm for each parameter group
+            # Compute scaled gradient norm for each parameter group (after LR scaling)
             grad_norm_dit = None
             grad_norm_encoder = None
             
@@ -341,19 +354,37 @@ def train_step_pmap(
                 if key in grads and grads[key] is not None:
                     grad_tree = grads[key]
                     grad_norm = get_norm(grad_tree)
-                    metrics[f"debug/grad_norm_{key}"] = grad_norm
+                    metrics[f"debug/grad_norm_{key}_scaled"] = grad_norm  # After LR scaling
                     
                     if key == 'dit':
                         grad_norm_dit = grad_norm
                     elif key == 'encoder':
                         grad_norm_encoder = grad_norm
             
-            # Compute ratio: DiT gradient / Encoder gradient
-            # If ratio > 1000, DiT đang học nhưng không truyền tin về Encoder
-            if grad_norm_dit is not None and grad_norm_encoder is not None:
-                metrics["debug/grad_norm_dit_total"] = grad_norm_dit
-                metrics["debug/grad_norm_encoder_total"] = grad_norm_encoder
-                metrics["debug/ratio_grad_dit_enc"] = grad_norm_dit / (grad_norm_encoder + 1e-8)
+            # Add raw grad norms (before LR scaling)
+            if raw_grad_norm_dit is not None:
+                metrics["debug/grad_norm_dit_raw"] = raw_grad_norm_dit
+            if raw_grad_norm_encoder is not None:
+                metrics["debug/grad_norm_encoder_raw"] = raw_grad_norm_encoder
+            
+            # Compute ratio: DiT gradient / Encoder gradient (using raw norms)
+            if raw_grad_norm_dit is not None and raw_grad_norm_encoder is not None:
+                metrics["debug/grad_norm_dit_total"] = raw_grad_norm_dit
+                metrics["debug/grad_norm_encoder_total"] = raw_grad_norm_encoder
+                metrics["debug/ratio_grad_dit_enc"] = raw_grad_norm_dit / (raw_grad_norm_encoder + 1e-8)
+            
+            # Compute effective step size (grad_norm * lr)
+            if raw_grad_norm_encoder is not None:
+                enc_lr_effective = enc_scale if enc_scale is not None else 1.0
+                metrics["debug/grad_step_encoder"] = raw_grad_norm_encoder * enc_lr_effective * base_lr
+            if raw_grad_norm_dit is not None:
+                dit_lr_effective = dit_scale if dit_scale is not None else 1.0
+                metrics["debug/grad_step_dit"] = raw_grad_norm_dit * dit_lr_effective * base_lr
+            
+            # Add LR scale info for reference
+            metrics["debug/encoder_lr_scale"] = enc_scale if enc_scale is not None else 1.0
+            metrics["debug/dit_lr_scale"] = dit_scale if dit_scale is not None else 1.0
+            metrics["debug/base_lr"] = base_lr
         
         # 3. Parameter norms (for reference)
         for key in ['dit', 'encoder']:
@@ -436,7 +467,7 @@ def train_step_single_device(
         if "debug/context_std" in losses:
             metrics["debug/context_std"] = losses["debug/context_std"]
         
-        # Gradient norms
+        # Gradient norms (single device: no LR scaling, so raw = scaled)
         def get_norm(tree):
             """Helper to compute L2 norm of all leaves in a tree"""
             leaves = jax.tree_util.tree_leaves(tree)
@@ -450,7 +481,9 @@ def train_step_single_device(
                 if key in grads and grads[key] is not None:
                     grad_tree = grads[key]
                     grad_norm = get_norm(grad_tree)
-                    metrics[f"debug/grad_norm_{key}"] = grad_norm
+                    # Single device: no LR scaling, so raw = scaled
+                    metrics[f"debug/grad_norm_{key}_raw"] = grad_norm
+                    metrics[f"debug/grad_norm_{key}_scaled"] = grad_norm
                     
                     if key == 'dit':
                         grad_norm_dit = grad_norm
