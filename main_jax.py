@@ -1485,7 +1485,7 @@ def create_argparser():
         context_pool_size=0,  # If > 0, pool context tokens to this size (reduces Nk, saves memory)
         cross_attn_layers="all",  # "all" or comma-separated layer indices (e.g., "2,3,4,5")
         # Debug / logging
-        debug_metrics=False,  # Gate heavy debug reductions in vfsddpm_loss
+        debug_metrics=True,  # Gate heavy debug reductions in vfsddpm_loss
     ) 
     defaults.update(model_and_diffusion_defaults_jax())
     parser = argparse.ArgumentParser()
