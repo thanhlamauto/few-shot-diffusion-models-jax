@@ -1486,6 +1486,7 @@ def create_argparser():
         cross_attn_layers="all",  # "all" or comma-separated layer indices (e.g., "2,3,4,5")
         # Debug / logging
         debug_metrics=True,  # Gate heavy debug reductions in vfsddpm_loss
+        use_context_layernorm=True,
     ) 
     defaults.update(model_and_diffusion_defaults_jax())
     parser = argparse.ArgumentParser()
