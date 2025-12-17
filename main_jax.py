@@ -1130,7 +1130,14 @@ def main():
     
     # Create dummy batch with exact training shape - go through SAME pipeline as real batches
     # This ensures identical compilation graph and prevents recompilation at step 0
-    dummy_batch_shape = (args.batch_size, cfg.sample_size, cfg.in_channels, cfg.image_size, cfg.image_size)
+    # When use_vae=True, images come in as original size, not latent size
+    if cfg.use_vae and cfg.original_image_size > 0:
+        dummy_image_size = cfg.original_image_size
+        dummy_in_channels = 3  # Original image channels
+    else:
+        dummy_image_size = cfg.image_size
+        dummy_in_channels = cfg.in_channels
+    dummy_batch_shape = (args.batch_size, cfg.sample_size, dummy_in_channels, dummy_image_size, dummy_image_size)
     # Start with numpy (like numpy_from_torch output)
     dummy_batch_np = np.zeros(dummy_batch_shape, dtype=np.float32)
     # Go through fix_set_size (same as real batches)

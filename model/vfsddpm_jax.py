@@ -79,6 +79,7 @@ class VFSDDPMConfig:
     use_vae: bool = False  # Enable VAE for latent space diffusion
     latent_channels: int = 4  # Latent space channels (when use_vae=True)
     latent_size: int = 0  # Latent space size (computed from image_size / downscale_factor, 0 = auto)
+    original_image_size: int = 0  # Original image size before VAE encoding (set when use_vae=True)
     # encoder
     encoder_mode: str = "vit_set"  # "vit" or "vit_set"
     hdim: int = 256
@@ -207,6 +208,9 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
         vae = StableVAE.create()
         vae_params = vae.params
         
+        # Store original image size before converting to latent space
+        original_image_size = cfg.image_size
+        
         # Calculate latent size if not set
         if cfg.latent_size <= 0:
             latent_size = cfg.image_size // vae.downscale_factor
@@ -218,9 +222,11 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
         effective_in_channels = cfg.latent_channels
         
         # Update cfg for encoder and DiT (they process latents)
+        # Also store original_image_size for VAE encode/decode
         cfg = dataclasses.replace(
             cfg, 
             latent_size=latent_size,
+            original_image_size=original_image_size,
             image_size=effective_image_size,
             in_channels=effective_in_channels
         )
@@ -531,7 +537,12 @@ def leave_one_out_c(
     if cfg.use_vae and batch_set.shape[2] == 3:
         vae = modules["vae"]
         vae_params = params["vae"]
-        original_image_size = cfg.latent_size * vae.downscale_factor
+        # Use original_image_size from cfg (set during init_models)
+        # Fallback to calculating from latent_size if not set (for backward compatibility)
+        if cfg.original_image_size > 0:
+            original_image_size = cfg.original_image_size
+        else:
+            original_image_size = cfg.latent_size * vae.downscale_factor
         
         # Reshape to HWC format: (b, ns, 3, H, W) -> (b*ns, H, W, 3)
         bs, ns, C, H, W = batch_set.shape
@@ -804,7 +815,12 @@ def vfsddpm_loss(
     if cfg.use_vae:
         vae = modules["vae"]
         vae_params = params["vae"]
-        original_image_size = cfg.latent_size * vae.downscale_factor  # Recover original size
+        # Use original_image_size from cfg (set during init_models)
+        # Fallback to calculating from latent_size if not set (for backward compatibility)
+        if cfg.original_image_size > 0:
+            original_image_size = cfg.original_image_size
+        else:
+            original_image_size = cfg.latent_size * vae.downscale_factor  # Recover original size
         
         # Reshape to HWC format for VAE: (bs, ns, C, H, W) -> (bs*ns, H, W, C)
         bs, ns, C, H, W = batch_set.shape
