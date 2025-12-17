@@ -540,6 +540,13 @@ def leave_one_out_c(
             f"Expected image size {original_image_size}x{original_image_size}, got {H}x{W}"
         assert C == 3, f"Expected 3 image channels for VAE encoding, got {C}"
         
+        # Log encoding (only first time)
+        if not hasattr(leave_one_out_c, "_logged_vae_encode"):
+            import sys
+            print(f"\n[VAE ENCODE] leave_one_out_c: Encoding images → latents", file=sys.stderr)
+            print(f"  Input shape (images): {batch_set.shape} (bs={bs}, ns={ns}, C={C}, H={H}, W={W})", file=sys.stderr)
+            leave_one_out_c._logged_vae_encode = True
+        
         batch_hwc = batch_set.transpose(0, 1, 3, 4, 2).reshape(bs * ns, H, W, C)
         
         # Encode to latents: (b*ns, H, W, 3) -> (b*ns, latent_H, latent_W, 4)
@@ -549,6 +556,13 @@ def leave_one_out_c(
         # Reshape back to CHW format: (b*ns, latent_H, latent_W, 4) -> (b, ns, 4, latent_H, latent_W)
         latent_H, latent_W = latents_hwc.shape[1], latents_hwc.shape[2]
         batch_set = latents_hwc.transpose(0, 3, 1, 2).reshape(bs, ns, 4, latent_H, latent_W)
+        
+        # Log after encoding (only first time)
+        if not hasattr(leave_one_out_c, "_logged_vae_encode_after"):
+            import sys
+            print(f"  Output shape (latents): {batch_set.shape} (bs={bs}, ns={ns}, C=4, H={latent_H}, W={latent_W})", file=sys.stderr)
+            print(f"  ✅ Successfully encoded to latent space\n", file=sys.stderr)
+            leave_one_out_c._logged_vae_encode_after = True
 
     # --- make t_emb like PyTorch: time_embed(timestep_embedding(t)) ---
     base_dim = cfg.hdim // 4
@@ -799,6 +813,14 @@ def vfsddpm_loss(
             f"Expected image size {original_image_size}x{original_image_size}, got {H}x{W}"
         assert C == 3, f"Expected 3 image channels for VAE encoding, got {C}"
         
+        # Log encoding (only first time to avoid spam)
+        if not hasattr(vfsddpm_loss, "_logged_vae_encode"):
+            import sys
+            print(f"\n[VAE ENCODE] vfsddpm_loss: Encoding images → latents", file=sys.stderr)
+            print(f"  Input shape (images): {batch_set.shape} (bs={bs}, ns={ns}, C={C}, H={H}, W={W})", file=sys.stderr)
+            print(f"  Original image size: {original_image_size}×{original_image_size}", file=sys.stderr)
+            vfsddpm_loss._logged_vae_encode = True
+        
         batch_hwc = batch_set.transpose(0, 1, 3, 4, 2).reshape(bs * ns, H, W, C)
         
         # Encode to latents: (bs*ns, H, W, 3) -> (bs*ns, latent_H, latent_W, 4)
@@ -808,6 +830,14 @@ def vfsddpm_loss(
         # Reshape back to CHW format: (bs*ns, latent_H, latent_W, 4) -> (bs, ns, 4, latent_H, latent_W)
         latent_H, latent_W = latents_hwc.shape[1], latents_hwc.shape[2]
         batch_set = latents_hwc.transpose(0, 3, 1, 2).reshape(bs, ns, 4, latent_H, latent_W)
+        
+        # Log after encoding (only first time)
+        if not hasattr(vfsddpm_loss, "_logged_vae_encode_after"):
+            import sys
+            print(f"  Output shape (latents): {batch_set.shape} (bs={bs}, ns={ns}, C=4, H={latent_H}, W={latent_W})", file=sys.stderr)
+            print(f"  Latent size: {latent_H}×{latent_W} (downscale: {H//latent_H}x)", file=sys.stderr)
+            print(f"  ✅ Successfully encoded to latent space\n", file=sys.stderr)
+            vfsddpm_loss._logged_vae_encode_after = True
     
     rng, t_key, noise_key = jax.random.split(rng, 3)
     t = jax.random.randint(t_key, (b,), 0, diffusion.num_timesteps)

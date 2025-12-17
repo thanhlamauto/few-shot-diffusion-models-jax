@@ -247,6 +247,12 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta, 
             vae_params = ema_params.get("vae")
             samples_np = np.array(samples)  # (b*ns, 4, latent_H, latent_W)
             
+            # Log decoding (only first batch)
+            if i == 0 and not hasattr(sample_loop, "_logged_vae_decode"):
+                print(f"\n[VAE DECODE] sample_loop: Decoding latents → images")
+                print(f"  Input shape (latents): {samples_np.shape}")
+                sample_loop._logged_vae_decode = True
+            
             # Reshape to HWC format: (b*ns, 4, latent_H, latent_W) -> (b*ns, latent_H, latent_W, 4)
             samples_hwc = samples_np.transpose(0, 2, 3, 1)
             
@@ -257,6 +263,12 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta, 
             samples = samples_decoded.transpose(0, 3, 1, 2)
             # Clip to [-1, 1] range
             samples = np.clip(samples, -1.0, 1.0)
+            
+            # Log after decoding (only first batch)
+            if i == 0 and not hasattr(sample_loop, "_logged_vae_decode_after"):
+                print(f"  Output shape (images): {samples.shape}")
+                print(f"  ✅ Successfully decoded from latent space\n")
+                sample_loop._logged_vae_decode_after = True
         
         # save npz
         out_path = os.path.join(DIR, f"samples_{i:03d}.npz")
@@ -430,6 +442,12 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
             # Decode latents to images if VAE is enabled
             samples_np = np.array(samples)  # (batch_size_fid * ns, C_or_latent_C, H_or_latent_H, W_or_latent_W)
             if cfg.use_vae:
+                # Log decoding (only first batch)
+                if generated_count == 0 and not hasattr(compute_fid_mixture, "_logged_vae_decode"):
+                    print(f"\n[VAE DECODE] compute_fid_mixture: Decoding latents → images")
+                    print(f"  Input shape (latents): {samples_np.shape}")
+                    compute_fid_mixture._logged_vae_decode = True
+                
                 # Reshape to HWC format: (bs*ns, 4, latent_H, latent_W) -> (bs*ns, latent_H, latent_W, 4)
                 samples_hwc = samples_np.transpose(0, 2, 3, 1)
                 
@@ -444,6 +462,12 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
                 samples_np = np.clip(samples_np, -1.0, 1.0)
                 # Update C, H, W for reshaping
                 C, H, W = 3, samples_decoded.shape[1], samples_decoded.shape[2]
+                
+                # Log after decoding (only first batch)
+                if generated_count == 0 and not hasattr(compute_fid_mixture, "_logged_vae_decode_after"):
+                    print(f"  Output shape (images): {samples_np.shape}")
+                    print(f"  ✅ Successfully decoded from latent space\n")
+                    compute_fid_mixture._logged_vae_decode_after = True
             
             # Reshape samples back to (batch_size_fid, ns, C, H, W) and split
             samples_np = samples_np.reshape(bs, ns, C, H, W)
@@ -508,6 +532,12 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
         # Decode latents to images if VAE is enabled
         samples_np = np.array(samples)  # (bs * ns, C_or_latent_C, H_or_latent_H, W_or_latent_W)
         if cfg.use_vae:
+            # Log decoding (only first time in remaining buffer)
+            if not hasattr(compute_fid_mixture, "_logged_vae_decode_remaining"):
+                print(f"\n[VAE DECODE] compute_fid_mixture (remaining buffer): Decoding latents → images")
+                print(f"  Input shape (latents): {samples_np.shape}")
+                compute_fid_mixture._logged_vae_decode_remaining = True
+            
             # Reshape to HWC format: (bs*ns, 4, latent_H, latent_W) -> (bs*ns, latent_H, latent_W, 4)
             samples_hwc = samples_np.transpose(0, 2, 3, 1)
             
@@ -522,6 +552,12 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
             samples_np = np.clip(samples_np, -1.0, 1.0)
             # Update C, H, W for reshaping
             C, H, W = 3, samples_decoded.shape[1], samples_decoded.shape[2]
+            
+            # Log after decoding (only first time)
+            if not hasattr(compute_fid_mixture, "_logged_vae_decode_remaining_after"):
+                print(f"  Output shape (images): {samples_np.shape}")
+                print(f"  ✅ Successfully decoded from latent space\n")
+                compute_fid_mixture._logged_vae_decode_remaining_after = True
         
         # Reshape and only take the items we actually need
         samples_np = samples_np.reshape(bs, ns, C, H, W)
