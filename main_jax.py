@@ -722,7 +722,12 @@ def main():
             logger.log(f"{'='*70}")
             logger.log(f"  VAE Model: pcuenq/sd-vae-ft-mse-flax")
             logger.log(f"  Downscale Factor: {vae.downscale_factor}x")
-            logger.log(f"  Original Image Size: {cfg.latent_size * vae.downscale_factor}×{cfg.latent_size * vae.downscale_factor}")
+            # Use original_image_size from cfg if set, otherwise calculate
+            if cfg.original_image_size > 0:
+                orig_size = cfg.original_image_size
+            else:
+                orig_size = cfg.latent_size * vae.downscale_factor if cfg.latent_size > 0 else 0
+            logger.log(f"  Original Image Size: {orig_size}×{orig_size}")
             logger.log(f"  Latent Size: {cfg.latent_size}×{cfg.latent_size}")
             logger.log(f"  Latent Channels: {cfg.latent_channels}")
             logger.log(f"  Memory Reduction: ~{(vae.downscale_factor**2):.0f}x (spatial)")

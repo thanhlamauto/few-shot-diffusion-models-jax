@@ -196,6 +196,7 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
     Returns:
         params: dict with encoder, dit, posterior (optional), vae (optional)
         modules: dict with encoder, dit, diffusion, posterior (optional), vae (optional)
+        cfg: updated config (with latent_size and original_image_size set if VAE enabled)
     """
     # Initialize VAE if enabled
     vae = None
@@ -338,7 +339,7 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
         params["posterior"] = post_params
         modules["posterior"] = posterior
 
-    return params, modules
+    return params, modules, cfg
 
 
 def encode_set(

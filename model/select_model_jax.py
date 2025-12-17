@@ -55,5 +55,5 @@ def select_model_jax(args, rng: jax.Array) -> Tuple[Dict[str, Any], Dict[str, An
         latent_channels=getattr(args, "latent_channels", 4),
         latent_size=getattr(args, "latent_size", 0),
     )
-    params, modules = init_models(rng, cfg)
+    params, modules, cfg = init_models(rng, cfg)
     return params, modules, cfg
