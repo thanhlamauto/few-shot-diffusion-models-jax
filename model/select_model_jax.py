@@ -50,6 +50,10 @@ def select_model_jax(args, rng: jax.Array) -> Tuple[Dict[str, Any], Dict[str, An
         # Gate heavy debug reductions inside vfsddpm_loss.
         # This lets you turn on detailed context/time stats from CLI/main_jax.
         debug_metrics=getattr(args, "debug_metrics", False),
+        # VAE (latent space)
+        use_vae=getattr(args, "use_vae", False),
+        latent_channels=getattr(args, "latent_channels", 4),
+        latent_size=getattr(args, "latent_size", 0),
     )
     params, modules = init_models(rng, cfg)
     return params, modules, cfg

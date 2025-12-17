@@ -226,14 +226,38 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta, 
         t_dummy = jnp.zeros((b,), dtype=jnp.int32)
         c_cond, _ = leave_one_out_c(sub, {"encoder": ema_params["encoder"], "posterior": ema_params.get(
             "posterior"), "time_embed": ema_params.get("time_embed")}, modules, batch_np, cfg, train=False, t=t_dummy)
-        # sampling shape
-        shape = (b * ns, c, h, w)
+        # sampling shape - use latent dimensions if VAE is enabled
+        if cfg.use_vae:
+            latent_c = cfg.latent_channels
+            latent_h = cfg.latent_size
+            latent_w = cfg.latent_size
+            shape = (b * ns, latent_c, latent_h, latent_w)
+        else:
+            shape = (b * ns, c, h, w)
         # model_apply using ema_params["dit"]
         model_apply = lambda params, x, t, c=None, **kw: dit.apply(
             params, x, t, c=c, **kw)
         samples = sample_ema(sub, ema_params["dit"], diffusion, model_apply,
                              shape, conditioning=c_cond, use_ddim=use_ddim, eta=eta,
                              ddim_num_steps=ddim_num_steps)
+        
+        # Decode latents to images if VAE is enabled
+        if cfg.use_vae:
+            vae = modules["vae"]
+            vae_params = ema_params.get("vae")
+            samples_np = np.array(samples)  # (b*ns, 4, latent_H, latent_W)
+            
+            # Reshape to HWC format: (b*ns, 4, latent_H, latent_W) -> (b*ns, latent_H, latent_W, 4)
+            samples_hwc = samples_np.transpose(0, 2, 3, 1)
+            
+            # Decode: (b*ns, latent_H, latent_W, 4) -> (b*ns, H, W, 3)
+            samples_decoded = vae.decode(samples_hwc, scale=True)
+            
+            # Reshape back to CHW format: (b*ns, H, W, 3) -> (b*ns, 3, H, W)
+            samples = samples_decoded.transpose(0, 3, 1, 2)
+            # Clip to [-1, 1] range
+            samples = np.clip(samples, -1.0, 1.0)
+        
         # save npz
         out_path = os.path.join(DIR, f"samples_{i:03d}.npz")
         np.savez(out_path, samples=np.array(samples), cond=batch_np)
@@ -387,8 +411,14 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
             
             diffusion = modules["diffusion"]
             model_apply = modules["dit"].apply
-            # Shape: (batch_size_fid * ns, C, H, W)
-            shape = (bs * ns, C, H, W)
+            # Shape: use latent dimensions if VAE is enabled
+            if cfg.use_vae:
+                latent_c = cfg.latent_channels
+                latent_h = cfg.latent_size
+                latent_w = cfg.latent_size
+                shape = (bs * ns, latent_c, latent_h, latent_w)
+            else:
+                shape = (bs * ns, C, H, W)
             
             rng, sample_rng = jax.random.split(rng)
             samples = sample_ema(
@@ -397,8 +427,25 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
                 ddim_num_steps=ddim_num_steps
             )
             
+            # Decode latents to images if VAE is enabled
+            samples_np = np.array(samples)  # (batch_size_fid * ns, C_or_latent_C, H_or_latent_H, W_or_latent_W)
+            if cfg.use_vae:
+                # Reshape to HWC format: (bs*ns, 4, latent_H, latent_W) -> (bs*ns, latent_H, latent_W, 4)
+                samples_hwc = samples_np.transpose(0, 2, 3, 1)
+                
+                # Decode: (bs*ns, latent_H, latent_W, 4) -> (bs*ns, H, W, 3)
+                vae = modules["vae"]
+                vae_params = ema_params.get("vae")
+                samples_decoded = vae.decode(samples_hwc, scale=True)
+                
+                # Reshape back to CHW format: (bs*ns, H, W, 3) -> (bs*ns, 3, H, W)
+                samples_np = samples_decoded.transpose(0, 3, 1, 2)
+                # Clip to [-1, 1] range
+                samples_np = np.clip(samples_np, -1.0, 1.0)
+                # Update C, H, W for reshaping
+                C, H, W = 3, samples_decoded.shape[1], samples_decoded.shape[2]
+            
             # Reshape samples back to (batch_size_fid, ns, C, H, W) and split
-            samples_np = np.array(samples)  # (batch_size_fid * ns, C, H, W)
             samples_np = samples_np.reshape(bs, ns, C, H, W)
             
             for i in range(bs):
@@ -442,7 +489,14 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
         
         diffusion = modules["diffusion"]
         model_apply = modules["dit"].apply
-        shape = (bs * ns, C, H, W)
+        # Shape: use latent dimensions if VAE is enabled
+        if cfg.use_vae:
+            latent_c = cfg.latent_channels
+            latent_h = cfg.latent_size
+            latent_w = cfg.latent_size
+            shape = (bs * ns, latent_c, latent_h, latent_w)
+        else:
+            shape = (bs * ns, C, H, W)
         
         rng, sample_rng = jax.random.split(rng)
         samples = sample_ema(
@@ -451,8 +505,25 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
             ddim_num_steps=ddim_num_steps
         )
         
+        # Decode latents to images if VAE is enabled
+        samples_np = np.array(samples)  # (bs * ns, C_or_latent_C, H_or_latent_H, W_or_latent_W)
+        if cfg.use_vae:
+            # Reshape to HWC format: (bs*ns, 4, latent_H, latent_W) -> (bs*ns, latent_H, latent_W, 4)
+            samples_hwc = samples_np.transpose(0, 2, 3, 1)
+            
+            # Decode: (bs*ns, latent_H, latent_W, 4) -> (bs*ns, H, W, 3)
+            vae = modules["vae"]
+            vae_params = ema_params.get("vae")
+            samples_decoded = vae.decode(samples_hwc, scale=True)
+            
+            # Reshape back to CHW format: (bs*ns, H, W, 3) -> (bs*ns, 3, H, W)
+            samples_np = samples_decoded.transpose(0, 3, 1, 2)
+            # Clip to [-1, 1] range
+            samples_np = np.clip(samples_np, -1.0, 1.0)
+            # Update C, H, W for reshaping
+            C, H, W = 3, samples_decoded.shape[1], samples_decoded.shape[2]
+        
         # Reshape and only take the items we actually need
-        samples_np = np.array(samples)  # (bs * ns, C, H, W)
         samples_np = samples_np.reshape(bs, ns, C, H, W)
         
         original_buffer_size = len(support_buffer) - (batch_size_fid - len(support_buffer))
@@ -605,6 +676,22 @@ def main():
 
     print(f"🔧 Initializing models...")
     params, modules, cfg = select_model_jax(args, rng_model)
+    
+    # Log VAE info if enabled
+    if cfg.use_vae:
+        vae = modules.get("vae")
+        if vae is not None:
+            logger.log(f"\n{'='*70}")
+            logger.log(f"VAE CONFIGURATION (Latent Space)")
+            logger.log(f"{'='*70}")
+            logger.log(f"  VAE Model: pcuenq/sd-vae-ft-mse-flax")
+            logger.log(f"  Downscale Factor: {vae.downscale_factor}x")
+            logger.log(f"  Original Image Size: {cfg.latent_size * vae.downscale_factor}×{cfg.latent_size * vae.downscale_factor}")
+            logger.log(f"  Latent Size: {cfg.latent_size}×{cfg.latent_size}")
+            logger.log(f"  Latent Channels: {cfg.latent_channels}")
+            logger.log(f"  Memory Reduction: ~{(vae.downscale_factor**2):.0f}x (spatial)")
+            logger.log(f"{'='*70}\n")
+    
     print(f"RSS after init_models: {rss_gb():.2f} GB")
     print(f"{'='*70}\n")
 
@@ -1487,6 +1574,10 @@ def create_argparser():
         # Debug / logging
         debug_metrics=True,  # Gate heavy debug reductions in vfsddpm_loss
         use_context_layernorm=True,
+        # VAE (latent space)
+        use_vae=False,  # Enable VAE for latent space diffusion
+        latent_channels=4,  # Latent space channels (when use_vae=True)
+        latent_size=0,  # Latent space size (0 = auto-compute from image_size / downscale_factor)
     ) 
     defaults.update(model_and_diffusion_defaults_jax())
     parser = argparse.ArgumentParser()

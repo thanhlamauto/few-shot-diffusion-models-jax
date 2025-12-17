@@ -75,6 +75,10 @@ class VFSDDPMConfig:
     image_size: int = 32
     in_channels: int = 3
     sample_size: int = 5  # number of elements per set (ns)
+    # VAE (latent space)
+    use_vae: bool = False  # Enable VAE for latent space diffusion
+    latent_channels: int = 4  # Latent space channels (when use_vae=True)
+    latent_size: int = 0  # Latent space size (computed from image_size / downscale_factor, 0 = auto)
     # encoder
     encoder_mode: str = "vit_set"  # "vit" or "vit_set"
     hdim: int = 256
@@ -189,13 +193,42 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
     """
     Initialize encoder, DiT, diffusion, and posterior (if variational).
     Returns:
-        params: dict with encoder, dit, posterior (optional)
-        modules: dict with encoder, dit, diffusion, posterior (optional)
+        params: dict with encoder, dit, posterior (optional), vae (optional)
+        modules: dict with encoder, dit, diffusion, posterior (optional), vae (optional)
     """
+    # Initialize VAE if enabled
+    vae = None
+    vae_params = None
+    effective_image_size = cfg.image_size
+    effective_in_channels = cfg.in_channels
+    
+    if cfg.use_vae:
+        from model.vae_jax import StableVAE
+        vae = StableVAE.create()
+        vae_params = vae.params
+        
+        # Calculate latent size if not set
+        if cfg.latent_size <= 0:
+            latent_size = cfg.image_size // vae.downscale_factor
+        else:
+            latent_size = cfg.latent_size
+        
+        # Update effective sizes for encoder and DiT (operate in latent space)
+        effective_image_size = latent_size
+        effective_in_channels = cfg.latent_channels
+        
+        # Update cfg for encoder and DiT (they process latents)
+        cfg = dataclasses.replace(
+            cfg, 
+            latent_size=latent_size,
+            image_size=effective_image_size,
+            in_channels=effective_in_channels
+        )
+    
     enc = build_encoder(cfg)
     dit, diffusion = create_model_and_diffusion(
-        image_size=cfg.image_size,
-        in_channels=cfg.in_channels,
+        image_size=effective_image_size,
+        in_channels=effective_in_channels,
         class_cond=cfg.class_cond,
         learn_sigma=cfg.learn_sigma,
         hidden_size=cfg.hidden_size,
@@ -231,8 +264,9 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
     rng, rng_enc, rng_dit = jax.random.split(rng, 3)
 
     # encoder params - MUST use forward_set to init to_time_embedding layer
+    # Note: encoder still uses original image channels/size (it processes latents when VAE is enabled)
     dummy_set = jnp.zeros(
-        (1, cfg.sample_size, cfg.in_channels, cfg.image_size, cfg.image_size),
+        (1, cfg.sample_size, effective_in_channels, effective_image_size, effective_image_size),
         dtype=jnp.float32,
     )
     dummy_t_emb = jnp.zeros((1 * cfg.sample_size, cfg.hdim), dtype=jnp.float32)
@@ -256,16 +290,16 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
             method=enc.forward_set
         )
 
-    # DiT params
+    # DiT params - uses effective (latent) sizes
     dummy_x = jnp.zeros(
-        (1, cfg.in_channels, cfg.image_size, cfg.image_size), dtype=jnp.float32
+        (1, effective_in_channels, effective_image_size, effective_image_size), dtype=jnp.float32
     )
     dummy_t = jnp.zeros((1,), dtype=jnp.int32)
     
     # CRITICAL: For lag mode, must provide dummy context to init cross-attention layers
     if cfg.mode_conditioning == "lag":
         # Create dummy context tokens: (b, num_patches, context_channels)
-        num_patches = (cfg.image_size // cfg.patch_size) ** 2
+        num_patches = (effective_image_size // cfg.patch_size) ** 2
         dummy_c = jnp.zeros((1, num_patches, cfg.context_channels), dtype=jnp.float32)
     else:
         dummy_c = None
@@ -275,6 +309,11 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
 
     params = {"encoder": enc_params, "dit": dit_params}
     modules = {"encoder": enc, "dit": dit, "diffusion": diffusion}
+    
+    # Add VAE if enabled
+    if cfg.use_vae:
+        params["vae"] = vae_params
+        modules["vae"] = vae
 
     # --- time_embed for encoder (mimic PyTorch generative_model.time_embed) ---
     base_dim = cfg.hdim // 4  # giống model_channels=64 nếu hdim=256
@@ -486,6 +525,30 @@ def leave_one_out_c(
     enc = modules["encoder"]
     posterior = modules.get("posterior")
     params_post = params.get("posterior")
+
+    # Encode images to latents if VAE is enabled and batch_set contains images (3 channels)
+    # Note: If called from vfsddpm_loss, batch_set may already be latents (4 channels)
+    if cfg.use_vae and batch_set.shape[2] == 3:
+        vae = modules["vae"]
+        vae_params = params["vae"]
+        original_image_size = cfg.latent_size * vae.downscale_factor
+        
+        # Reshape to HWC format: (b, ns, 3, H, W) -> (b*ns, H, W, 3)
+        bs, ns, C, H, W = batch_set.shape
+        # Validate image dimensions (allow some tolerance for rounding)
+        assert abs(H - original_image_size) <= 1 and abs(W - original_image_size) <= 1, \
+            f"Expected image size {original_image_size}x{original_image_size}, got {H}x{W}"
+        assert C == 3, f"Expected 3 image channels for VAE encoding, got {C}"
+        
+        batch_hwc = batch_set.transpose(0, 1, 3, 4, 2).reshape(bs * ns, H, W, C)
+        
+        # Encode to latents: (b*ns, H, W, 3) -> (b*ns, latent_H, latent_W, 4)
+        rng, vae_rng = jax.random.split(rng)
+        latents_hwc = vae.encode(vae_rng, batch_hwc, scale=True)
+        
+        # Reshape back to CHW format: (b*ns, latent_H, latent_W, 4) -> (b, ns, 4, latent_H, latent_W)
+        latent_H, latent_W = latents_hwc.shape[1], latents_hwc.shape[2]
+        batch_set = latents_hwc.transpose(0, 3, 1, 2).reshape(bs, ns, 4, latent_H, latent_W)
 
     # --- make t_emb like PyTorch: time_embed(timestep_embedding(t)) ---
     base_dim = cfg.hdim // 4
@@ -703,7 +766,7 @@ def vfsddpm_loss(
     rng: PRNGKey,
     params: Dict[str, Any],
     modules: Dict[str, Any],
-    batch_set: Array,  # (bs, ns, C, H, W), values in [-1, 1]
+    batch_set: Array,  # (bs, ns, C, H, W), values in [-1, 1] (images if use_vae=False, latents if use_vae=True)
     cfg: VFSDDPMConfig,
     train: bool = True,
 ) -> Dict[str, Array]:
@@ -720,6 +783,32 @@ def vfsddpm_loss(
     b, ns = batch_set.shape[:2]
     # Double-check after fix_set_size
     assert ns == cfg.sample_size, f"After fix_set_size: batch_set ns={ns} != cfg.sample_size={cfg.sample_size}. This will cause JAX to compile multiple versions!"
+    
+    # Encode images to latents if VAE is enabled
+    # Note: batch_set comes in as images (bs, ns, 3, H, W) when use_vae=True
+    # We need to encode to latents (bs, ns, 4, latent_H, latent_W)
+    if cfg.use_vae:
+        vae = modules["vae"]
+        vae_params = params["vae"]
+        original_image_size = cfg.latent_size * vae.downscale_factor  # Recover original size
+        
+        # Reshape to HWC format for VAE: (bs, ns, C, H, W) -> (bs*ns, H, W, C)
+        bs, ns, C, H, W = batch_set.shape
+        # Validate image dimensions (allow some tolerance for rounding)
+        assert abs(H - original_image_size) <= 1 and abs(W - original_image_size) <= 1, \
+            f"Expected image size {original_image_size}x{original_image_size}, got {H}x{W}"
+        assert C == 3, f"Expected 3 image channels for VAE encoding, got {C}"
+        
+        batch_hwc = batch_set.transpose(0, 1, 3, 4, 2).reshape(bs * ns, H, W, C)
+        
+        # Encode to latents: (bs*ns, H, W, 3) -> (bs*ns, latent_H, latent_W, 4)
+        rng, vae_rng = jax.random.split(rng)
+        latents_hwc = vae.encode(vae_rng, batch_hwc, scale=True)
+        
+        # Reshape back to CHW format: (bs*ns, latent_H, latent_W, 4) -> (bs, ns, 4, latent_H, latent_W)
+        latent_H, latent_W = latents_hwc.shape[1], latents_hwc.shape[2]
+        batch_set = latents_hwc.transpose(0, 3, 1, 2).reshape(bs, ns, 4, latent_H, latent_W)
+    
     rng, t_key, noise_key = jax.random.split(rng, 3)
     t = jax.random.randint(t_key, (b,), 0, diffusion.num_timesteps)
     t_rep = jnp.repeat(t, ns, axis=0)
