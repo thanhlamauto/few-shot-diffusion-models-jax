@@ -224,8 +224,17 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta, 
         # build conditioning c (host-side, deterministic)
         # Create dummy timestep for encoding (encoder needs t for time_embed)
         t_dummy = jnp.zeros((b,), dtype=jnp.int32)
-        c_cond, _ = leave_one_out_c(sub, {"encoder": ema_params["encoder"], "posterior": ema_params.get(
-            "posterior"), "time_embed": ema_params.get("time_embed")}, modules, batch_np, cfg, train=False, t=t_dummy)
+        # Use full EMA params needed for conditioning (include VAE params if present)
+        params_loo = {
+            "encoder": ema_params["encoder"],
+            "posterior": ema_params.get("posterior"),
+            "time_embed": ema_params.get("time_embed"),
+        }
+        if cfg.use_vae and "vae" in ema_params:
+            params_loo["vae"] = ema_params["vae"]
+        c_cond, _ = leave_one_out_c(
+            sub, params_loo, modules, batch_np, cfg, train=False, t=t_dummy
+        )
         # sampling shape - use latent dimensions if VAE is enabled
         if cfg.use_vae:
             latent_c = cfg.latent_channels
@@ -409,9 +418,13 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
             mini_batch = fix_set_size(jnp.array(mini_batch), cfg.sample_size)
             mini_batch = np.array(mini_batch)  # Convert back to numpy
             
-            sub = {"encoder": ema_params["encoder"],
-                   "posterior": ema_params.get("posterior"),
-                   "time_embed": ema_params.get("time_embed")}
+            sub = {
+                "encoder": ema_params["encoder"],
+                "posterior": ema_params.get("posterior"),
+                "time_embed": ema_params.get("time_embed"),
+            }
+            if cfg.use_vae and "vae" in ema_params:
+                sub["vae"] = ema_params["vae"]
             rng, cond_rng = jax.random.split(rng)
             
             # Create dummy timestep for encoding (encoder needs t for time_embed)
@@ -501,9 +514,13 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
         mini_batch = fix_set_size(jnp.array(mini_batch), cfg.sample_size)
         mini_batch = np.array(mini_batch)
         
-        sub = {"encoder": ema_params["encoder"],
-               "posterior": ema_params.get("posterior"),
-               "time_embed": ema_params.get("time_embed")}
+        sub = {
+            "encoder": ema_params["encoder"],
+            "posterior": ema_params.get("posterior"),
+            "time_embed": ema_params.get("time_embed"),
+        }
+        if cfg.use_vae and "vae" in ema_params:
+            sub["vae"] = ema_params["vae"]
         rng, cond_rng = jax.random.split(rng)
         
         bs = mini_batch.shape[0]
