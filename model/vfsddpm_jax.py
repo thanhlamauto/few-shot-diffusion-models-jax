@@ -83,6 +83,9 @@ class VFSDDPMConfig:
     # Control whether encoder (ViT / sViT) operates on latents or original images when use_vae=True.
     # Backwards-compatible default: True → encoder also uses latents (old behavior).
     encoder_uses_vae: bool = True
+    # Separate patch sizes for encoder and DiT (0 = fall back to patch_size)
+    encoder_patch_size: int = 0
+    dit_patch_size: int = 0
     # encoder
     encoder_mode: str = "vit_set"  # "vit" or "vit_set"
     hdim: int = 256
@@ -129,10 +132,12 @@ class VFSDDPMConfig:
 
 def build_encoder(cfg: VFSDDPMConfig) -> nn.Module:
     mlp_dim = int(cfg.hdim * cfg.encoder_mlp_ratio)
+    # Effective patch size for encoder: override if encoder_patch_size > 0
+    patch_size_enc = cfg.encoder_patch_size if cfg.encoder_patch_size > 0 else cfg.patch_size
     if cfg.encoder_mode == "vit":
         return ViT(
             image_size=(cfg.image_size, cfg.image_size),
-            patch_size=(cfg.patch_size, cfg.patch_size),
+            patch_size=(patch_size_enc, patch_size_enc),
             num_classes=cfg.hdim,
             dim=cfg.hdim,
             depth=cfg.encoder_depth,
@@ -147,7 +152,7 @@ def build_encoder(cfg: VFSDDPMConfig) -> nn.Module:
         )
     return sViT(
         image_size=(cfg.image_size, cfg.image_size),
-        patch_size=cfg.patch_size,
+            patch_size=patch_size_enc,
         num_classes=cfg.hdim,
         dim=cfg.hdim,
         depth=cfg.encoder_depth,
@@ -250,6 +255,9 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
             )
     
     enc = build_encoder(cfg)
+    # Effective patch size for DiT: override if dit_patch_size > 0
+    dit_patch = cfg.dit_patch_size if cfg.dit_patch_size > 0 else cfg.patch_size
+
     dit, diffusion = create_model_and_diffusion(
         image_size=effective_image_size,
         in_channels=effective_in_channels,
@@ -261,7 +269,7 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
         mode_conditioning=cfg.mode_conditioning,
         num_heads=cfg.num_heads,
         mlp_ratio=cfg.mlp_ratio,
-        patch_size=cfg.patch_size,
+        patch_size=dit_patch,
         dropout=cfg.dropout,
         cross_attn_layers=getattr(cfg, "cross_attn_layers", "all"),
         use_context_layernorm=getattr(cfg, "use_context_layernorm", True),
@@ -406,7 +414,7 @@ def encode_set(
             t_emb_vit = None
         
         # Use forward_set to get tokens if needed
-        if return_tokens and cfg.mode_conditioning == "lag":
+            if return_tokens and cfg.mode_conditioning == "lag":
             # Pass rngs for dropout if train=True and dropout > 0
             apply_kwargs = {
                 "train": train,
@@ -428,7 +436,8 @@ def encode_set(
             b_actual = tokens.shape[0]
             num_patches_actual = tokens.shape[1]
             hdim_actual = tokens.shape[2]
-            num_patches_expected = (cfg.image_size // cfg.patch_size) ** 2
+            patch_size_enc = cfg.encoder_patch_size if cfg.encoder_patch_size > 0 else cfg.patch_size
+            num_patches_expected = (cfg.image_size // patch_size_enc) ** 2
             
             assert tokens.ndim == 3, f"ViT tokens must be 3D, got {tokens.ndim}D"
             assert hdim_actual == cfg.hdim, \
@@ -477,7 +486,8 @@ def encode_set(
             b_actual = tokens.shape[0]
             num_patches_actual = tokens.shape[1]
             hdim_actual = tokens.shape[2]
-            num_patches_expected = (cfg.image_size // cfg.patch_size) ** 2
+            patch_size_enc = cfg.encoder_patch_size if cfg.encoder_patch_size > 0 else cfg.patch_size
+            num_patches_expected = (cfg.image_size // patch_size_enc) ** 2
             
             assert tokens.ndim == 3, f"tokens must be 3D, got {tokens.ndim}D"
             assert hdim_actual == cfg.hdim, \
@@ -620,7 +630,8 @@ def leave_one_out_c(
     
     # Pre-allocate arrays for both modes (fixed shapes for all iterations)
     if need_tokens:
-        num_patches = (cfg.image_size // cfg.patch_size) ** 2
+        patch_size_enc = cfg.encoder_patch_size if cfg.encoder_patch_size > 0 else cfg.patch_size
+        num_patches = (cfg.image_size // patch_size_enc) ** 2
         init_token_set = jnp.zeros((b, ns, num_patches, cfg.hdim), dtype=jnp.float32)
         init_c_list = None
     else:

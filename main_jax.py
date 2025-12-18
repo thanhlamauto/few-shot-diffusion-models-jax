@@ -1579,6 +1579,9 @@ def create_argparser():
         image_size=32,
         sample_size=6,  # Changed from 5 to 6 to match typical usage
         patch_size=8,
+        # Optional separate patch sizes (0 = fall back to patch_size)
+        encoder_patch_size=0,
+        dit_patch_size=0,
         hdim=448,  # Must be divisible by 4 for positional embeddings (depth=6, ~43M params)
         in_channels=3,
         encoder_mode="vit_set",

@@ -31,6 +31,8 @@ def select_model_jax(args, rng: jax.Array) -> Tuple[Dict[str, Any], Dict[str, An
         num_heads=args.num_heads,
         mlp_ratio=args.mlp_ratio,
         patch_size=args.patch_size,
+        encoder_patch_size=getattr(args, "encoder_patch_size", 0),
+        dit_patch_size=getattr(args, "dit_patch_size", 0),
         context_channels=args.context_channels,
         mode_conditioning=args.mode_conditioning,
         class_cond=False,
