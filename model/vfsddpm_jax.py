@@ -390,7 +390,7 @@ def encode_set(
         hc: (b, hdim) pooled representation
         tokens: (b, num_patches, hdim) patch tokens (only if return_tokens=True and lag mode)
     """
-        # DEBUG: Log encode_set call (only first call)
+    # DEBUG: Log encode_set call (only first call)
     if not hasattr(encode_set, "_logged"):
         import sys
         print(f"\n[DEBUG encode_set] Called with:", file=sys.stderr)
@@ -414,11 +414,11 @@ def encode_set(
             t_emb_vit = None
         
         # Use forward_set to get tokens if needed
-            if return_tokens and cfg.mode_conditioning == "lag":
+        if return_tokens and cfg.mode_conditioning == "lag":
             # Pass rngs for dropout if train=True and dropout > 0
             apply_kwargs = {
                 "train": train,
-                "method": encoder.forward_set
+                "method": encoder.forward_set,
             }
             if train and cfg.dropout > 0 and rng is not None:
                 apply_kwargs["rngs"] = {"dropout": rng}
@@ -450,7 +450,7 @@ def encode_set(
             # Use forward_set but don't return tokens
             apply_kwargs = {
                 "train": train,
-                "method": encoder.forward_set
+                "method": encoder.forward_set,
             }
             if train and cfg.dropout > 0 and rng is not None:
                 apply_kwargs["rngs"] = {"dropout": rng}
