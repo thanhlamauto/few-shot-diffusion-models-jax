@@ -80,6 +80,9 @@ class VFSDDPMConfig:
     latent_channels: int = 4  # Latent space channels (when use_vae=True)
     latent_size: int = 0  # Latent space size (computed from image_size / downscale_factor, 0 = auto)
     original_image_size: int = 0  # Original image size before VAE encoding (set when use_vae=True)
+    # Control whether encoder (ViT / sViT) operates on latents or original images when use_vae=True.
+    # Backwards-compatible default: True → encoder also uses latents (old behavior).
+    encoder_uses_vae: bool = True
     # encoder
     encoder_mode: str = "vit_set"  # "vit" or "vit_set"
     hdim: int = 256
@@ -201,6 +204,8 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
     # Initialize VAE if enabled
     vae = None
     vae_params = None
+    # effective_* are the spatial size and channels seen by the DiT (diffusion backbone).
+    # By default they match the data config. When use_vae=True, DiT will operate in latent space.
     effective_image_size = cfg.image_size
     effective_in_channels = cfg.in_channels
     
@@ -218,19 +223,31 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
         else:
             latent_size = cfg.latent_size
         
-        # Update effective sizes for encoder and DiT (operate in latent space)
+        # DiT / diffusion always operate in latent space when use_vae=True
         effective_image_size = latent_size
         effective_in_channels = cfg.latent_channels
         
-        # Update cfg for encoder and DiT (they process latents)
-        # Also store original_image_size for VAE encode/decode
-        cfg = dataclasses.replace(
-            cfg, 
-            latent_size=latent_size,
-            original_image_size=original_image_size,
-            image_size=effective_image_size,
-            in_channels=effective_in_channels
-        )
+        # Update cfg with latent metadata and, depending on encoder_uses_vae, either:
+        # - keep encoder on latents (old behavior), or
+        # - keep encoder on original images (new behavior).
+        if cfg.encoder_uses_vae:
+            # Old behavior: encoder also processes latents
+            cfg = dataclasses.replace(
+                cfg,
+                latent_size=latent_size,
+                original_image_size=original_image_size,
+                image_size=effective_image_size,
+                in_channels=effective_in_channels,
+            )
+        else:
+            # New behavior: encoder stays in image space (32x32x3 for CIFAR),
+            # DiT operates in latent space only.
+            cfg = dataclasses.replace(
+                cfg,
+                latent_size=latent_size,
+                original_image_size=original_image_size,
+                # Leave image_size and in_channels as original
+            )
     
     enc = build_encoder(cfg)
     dit, diffusion = create_model_and_diffusion(
@@ -271,9 +288,10 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
     rng, rng_enc, rng_dit = jax.random.split(rng, 3)
 
     # encoder params - MUST use forward_set to init to_time_embedding layer
-    # Note: encoder still uses original image channels/size (it processes latents when VAE is enabled)
+    # Encoder always uses cfg.image_size / cfg.in_channels (image space) when
+    # encoder_uses_vae=False, otherwise it uses latent space (old behavior).
     dummy_set = jnp.zeros(
-        (1, cfg.sample_size, effective_in_channels, effective_image_size, effective_image_size),
+        (1, cfg.sample_size, cfg.in_channels, cfg.image_size, cfg.image_size),
         dtype=jnp.float32,
     )
     dummy_t_emb = jnp.zeros((1 * cfg.sample_size, cfg.hdim), dtype=jnp.float32)
@@ -533,9 +551,11 @@ def leave_one_out_c(
     posterior = modules.get("posterior")
     params_post = params.get("posterior")
 
-    # Encode images to latents if VAE is enabled and batch_set contains images (3 channels)
-    # Note: If called from vfsddpm_loss, batch_set may already be latents (4 channels)
-    if cfg.use_vae and batch_set.shape[2] == 3:
+    # Encode images to latents for encoder if VAE is enabled, encoder_uses_vae=True,
+    # and batch_set currently contains images (3 channels).
+    # Note: If called from vfsddpm_loss with encoder_uses_vae=True, batch_set may
+    # already be latents (4 channels) and this block will be skipped.
+    if cfg.use_vae and cfg.encoder_uses_vae and batch_set.shape[2] == 3:
         vae = modules["vae"]
         vae_params = params["vae"]
         # Use original_image_size from cfg (set during init_models)
@@ -810,9 +830,12 @@ def vfsddpm_loss(
     # Double-check after fix_set_size
     assert ns == cfg.sample_size, f"After fix_set_size: batch_set ns={ns} != cfg.sample_size={cfg.sample_size}. This will cause JAX to compile multiple versions!"
     
-    # Encode images to latents if VAE is enabled
-    # Note: batch_set comes in as images (bs, ns, 3, H, W) when use_vae=True
-    # We need to encode to latents (bs, ns, 4, latent_H, latent_W)
+    # Keep a copy of images for encoder when encoder_uses_vae is False.
+    batch_images = batch_set
+    batch_latents = batch_set
+
+    # Encode images to latents if VAE is enabled (for diffusion / DiT input).
+    # Note: batch_set comes in as images (bs, ns, 3, H, W) when use_vae=True.
     if cfg.use_vae:
         vae = modules["vae"]
         vae_params = params["vae"]
@@ -846,15 +869,18 @@ def vfsddpm_loss(
         
         # Reshape back to CHW format: (bs*ns, latent_H, latent_W, 4) -> (bs, ns, 4, latent_H, latent_W)
         latent_H, latent_W = latents_hwc.shape[1], latents_hwc.shape[2]
-        batch_set = latents_hwc.transpose(0, 3, 1, 2).reshape(bs, ns, 4, latent_H, latent_W)
+        batch_latents = latents_hwc.transpose(0, 3, 1, 2).reshape(bs, ns, 4, latent_H, latent_W)
         
         # Log after encoding (only first time)
         if not hasattr(vfsddpm_loss, "_logged_vae_encode_after"):
             import sys
-            print(f"  Output shape (latents): {batch_set.shape} (bs={bs}, ns={ns}, C=4, H={latent_H}, W={latent_W})", file=sys.stderr)
+            print(f"  Output shape (latents): {batch_latents.shape} (bs={bs}, ns={ns}, C=4, H={latent_H}, W={latent_W})", file=sys.stderr)
             print(f"  Latent size: {latent_H}×{latent_W} (downscale: {H//latent_H}x)", file=sys.stderr)
             print(f"  ✅ Successfully encoded to latent space\n", file=sys.stderr)
             vfsddpm_loss._logged_vae_encode_after = True
+    else:
+        # No VAE: latents are just the original images
+        batch_latents = batch_set
     
     rng, t_key, noise_key = jax.random.split(rng, 3)
     t = jax.random.randint(t_key, (b,), 0, diffusion.num_timesteps)
@@ -862,11 +888,17 @@ def vfsddpm_loss(
 
     # conditioning
     rng_c, rng_loss, rng_dit_dropout = jax.random.split(noise_key, 3)
-    c, klc = leave_one_out_c(rng_c, params, modules,
-                             batch_set, cfg, train=train, t=t)
+    # Encoder sees images if encoder_uses_vae=False, otherwise it sees latents.
+    if cfg.use_vae and not cfg.encoder_uses_vae:
+        cond_batch = batch_images
+    else:
+        cond_batch = batch_latents
+    c, klc = leave_one_out_c(
+        rng_c, params, modules, cond_batch, cfg, train=train, t=t
+    )
 
-    # flatten images
-    x = batch_set.reshape(b * ns, *batch_set.shape[2:])
+    # flatten images/latents for diffusion model input
+    x = batch_latents.reshape(b * ns, *batch_latents.shape[2:])
 
     def model_fn(x_in, t_in, _c_unused, **kwargs):
         # ASSERT 6 (continued): Verify x and c have matching batch dimension

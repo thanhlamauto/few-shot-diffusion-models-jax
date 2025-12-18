@@ -52,6 +52,7 @@ def select_model_jax(args, rng: jax.Array) -> Tuple[Dict[str, Any], Dict[str, An
         debug_metrics=getattr(args, "debug_metrics", False),
         # VAE (latent space)
         use_vae=getattr(args, "use_vae", False),
+        encoder_uses_vae=getattr(args, "encoder_uses_vae", True),
         latent_channels=getattr(args, "latent_channels", 4),
         latent_size=getattr(args, "latent_size", 0),
     )

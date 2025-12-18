@@ -1640,9 +1640,12 @@ def create_argparser():
         debug_metrics=True,  # Gate heavy debug reductions in vfsddpm_loss
         use_context_layernorm=True,
         # VAE (latent space)
-        use_vae=False,  # Enable VAE for latent space diffusion
+        use_vae=False,  # Enable VAE for latent space diffusion (DiT)
         latent_channels=4,  # Latent space channels (when use_vae=True)
         latent_size=0,  # Latent space size (0 = auto-compute from image_size / downscale_factor)
+        # Control whether encoder (ViT/sViT) uses latents or original images when use_vae=True.
+        # Default True to match previous behavior (encoder also operates in latent space).
+        encoder_uses_vae=True,
     ) 
     defaults.update(model_and_diffusion_defaults_jax())
     parser = argparse.ArgumentParser()
