@@ -1398,8 +1398,20 @@ def main():
                     logger.logkv("eval_loss", eval_loss)
                     logger.dumpkvs(global_step)
 
+                    # Determine which split to use for generation
+                    generation_split = getattr(args, 'generation_split', 'val')
+                    if generation_split == 'train':
+                        generation_loader = train_loader
+                        split_name = "train"
+                    else:
+                        generation_loader = val_loader
+                        split_name = "val"
+                    
+                    logger.log(f"🎨 Generating samples from {split_name} set (for debugging model learning)")
+
                     # Load or create fixed support sets for progression tracking
-                    fixed_support_cache_path = os.path.join(DIR, "fixed_support_sets.npz")
+                    # Use separate cache files for train vs val
+                    fixed_support_cache_path = os.path.join(DIR, f"fixed_support_sets_{split_name}.npz")
                     fixed_support_sets = None
                     
                     if os.path.exists(fixed_support_cache_path):
@@ -1407,14 +1419,14 @@ def main():
                         try:
                             cache_data = np.load(fixed_support_cache_path)
                             fixed_support_sets = cache_data["support_sets"]
-                            logger.log(f"✅ Loaded fixed support sets from cache ({fixed_support_sets.shape[0]} sets)")
+                            logger.log(f"✅ Loaded fixed support sets from {split_name} cache ({fixed_support_sets.shape[0]} sets)")
                         except Exception as e:
                             logger.log(f"⚠️  Could not load fixed support cache: {e}, will create new one")
                     
                     if fixed_support_sets is None:
                         # First time: create and cache fixed support sets
-                        logger.log(f"📝 Creating fixed support sets cache (2 sets for progression tracking)...")
-                        it_temp = iter(val_loader)
+                        logger.log(f"📝 Creating fixed support sets cache from {split_name} set (2 sets for progression tracking)...")
+                        it_temp = iter(generation_loader)
                         temp_batches = []
                         for i in range(2):  # Only need 2 sets
                             try:
@@ -1438,11 +1450,11 @@ def main():
                             fixed_support_sets = np.concatenate(temp_batches, axis=0)[:2]  # Only keep first 2 sets
                             # Save to cache
                             np.savez(fixed_support_cache_path, support_sets=fixed_support_sets)
-                            logger.log(f"✅ Cached {fixed_support_sets.shape[0]} fixed support sets for progression tracking")
+                            logger.log(f"✅ Cached {fixed_support_sets.shape[0]} fixed support sets from {split_name} set for progression tracking")
                     
                     # Generate samples using fixed support sets
                     samples, support = sample_loop(
-                        p_state, modules, cfg, val_loader, 2, rng, args.use_ddim, args.eta, args,
+                        p_state, modules, cfg, generation_loader, 2, rng, args.use_ddim, args.eta, args,
                         ddim_num_steps=args.ddim_num_steps, fixed_support_sets=fixed_support_sets)
 
                     # Initialize log_dict (will be used for both wandb and non-wandb cases)
@@ -1705,6 +1717,12 @@ def create_argparser():
         latent_channels=4,  # Latent space channels (when use_vae=True)
         latent_size=0,  # Latent space size (0 = auto-compute from image_size / downscale_factor)
         # Control whether encoder (ViT/sViT) uses latents or original images when use_vae=True.
+        # Backwards-compatible default: True → encoder also uses latents (old behavior).
+        encoder_uses_vae=True,
+        # Generation split: which dataset split to use for sample generation visualization
+        # "val" (default): use validation set (proper evaluation)
+        # "train": use training set (for debugging - to check if model is learning)
+        generation_split="val",
         # Default True to match previous behavior (encoder also operates in latent space).
         encoder_uses_vae=True,
     ) 
