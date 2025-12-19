@@ -139,6 +139,9 @@ class ViT(nn.Module):
         # head
         self.cls_norm = nn.LayerNorm()
         self.cls_dense = nn.Dense(self.num_classes)
+        
+        # embedding dropout layer
+        self.emb_dropout_layer = nn.Dropout(self.emb_dropout)
 
     # tương đương forward(self, img)
     def __call__(self, img, train: bool = True):
@@ -160,7 +163,7 @@ class ViT(nn.Module):
         x = jnp.concatenate([cls_tokens, x], axis=1)  # (b, n+1, dim)
 
         x = x + self.pos_embedding[:, : (n + 1), :]
-        x = nn.Dropout(self.emb_dropout)(x, deterministic=not train)
+        x = self.emb_dropout_layer(x, deterministic=not train)
 
         x_set = self.transformer(x, train=train)
 
@@ -251,7 +254,7 @@ class ViT(nn.Module):
             )
             x = x + pos_embedding_patches[:, : (np + self.k), :]
 
-        x = nn.Dropout(self.emb_dropout)(x, deterministic=not train)
+        x = self.emb_dropout_layer(x, deterministic=not train)
         x_set = self.transformer(x, train=train)
 
         if self.pool == "agg":

@@ -16,7 +16,7 @@ python main_jax.py \
   --encoder_uses_vae False \
   --log_interval 300 --save_interval 20000 --num_eval_batches 10 --num_sample_batches 2 \
   --use_wandb True --wandb_project fsdm-jax --max_steps 300000 \
-  --diffusion_steps 150 --hidden_size 512 --depth 12 --num_heads 8 --mlp_ratio 4.0 \
+  --diffusion_steps 150 --hidden_size 456 --depth 12 --num_heads 8 --mlp_ratio 4.0 \
   --compute_fid True --fid_num_samples 512 \
   --encoder_depth 9 \
   --encoder_heads 3 \
