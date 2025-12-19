@@ -1718,13 +1718,9 @@ def create_argparser():
         latent_size=0,  # Latent space size (0 = auto-compute from image_size / downscale_factor)
         # Control whether encoder (ViT/sViT) uses latents or original images when use_vae=True.
         # Backwards-compatible default: True → encoder also uses latents (old behavior).
-        encoder_uses_vae=True,
-        # Generation split: which dataset split to use for sample generation visualization
-        # "val" (default): use validation set (proper evaluation)
-        # "train": use training set (for debugging - to check if model is learning)
         generation_split="val",
         # Default True to match previous behavior (encoder also operates in latent space).
-        encoder_uses_vae=True,
+        encoder_uses_vae=False,
     ) 
     defaults.update(model_and_diffusion_defaults_jax())
     parser = argparse.ArgumentParser()
