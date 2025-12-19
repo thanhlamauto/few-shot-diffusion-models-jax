@@ -789,9 +789,16 @@ def leave_one_out_c(
                 return_tokens=True,
                 rng=key_i,
             )
-            # tokens: (b, num_patches, hdim)
+            # tokens: (b*ns, num_patches, hdim) from encode_set
+            # Reshape to (b, ns, num_patches, hdim) and extract tokens for image i
+            b_actual = tokens.shape[0] // ns
+            num_patches = tokens.shape[1]
+            hdim_actual = tokens.shape[2]
+            tokens_reshaped = tokens.reshape(b_actual, ns, num_patches, hdim_actual)  # (b, ns, np, dim)
+            # Extract tokens for image i (the target image in this iteration)
+            tokens_i = tokens_reshaped[:, i, :, :]  # (b, np, dim)
             # Update token_set at index i
-            token_set_carry = token_set_carry.at[:, i, :, :].set(tokens)
+            token_set_carry = token_set_carry.at[:, i, :, :].set(tokens_i)
         else:
             # Only get hc for film mode
             hc = encode_set(
