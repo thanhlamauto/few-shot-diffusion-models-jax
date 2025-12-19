@@ -182,10 +182,14 @@ def eval_loop(p_state, modules, cfg, loader, n_devices, num_batches, args):
     return float(np.mean(losses))
 
 
-def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta, args, ddim_num_steps=None):
+def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta, args, ddim_num_steps=None, fixed_support_sets=None):
     """
     Minimal sampling: use first batches from loader, build conditioning, and run diffusion.
     Saves .npz files with samples/cond and returns samples for logging.
+    
+    Args:
+        fixed_support_sets: Optional fixed support sets (numpy array) to reuse across steps.
+                           If None, will load from loader and optionally save to cache.
     """
     if num_batches <= 0:
         return None, None
@@ -195,16 +199,28 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta, 
     encoder = modules["encoder"]
     posterior = modules.get("posterior")
 
-    it = iter(loader)
     all_samples = []
     all_support = []
 
-    for i in tqdm(range(num_batches), desc="Sampling", unit="batch"):
-        try:
-            batch = next(it)
-        except StopIteration:
+    # Use fixed support sets if provided, otherwise load from loader
+    if fixed_support_sets is not None:
+        # Use provided fixed support sets
+        support_batches = [fixed_support_sets[i] for i in range(min(num_batches, len(fixed_support_sets)))]
+    else:
+        # Load from loader
+        it = iter(loader)
+        support_batches = []
+        for i in range(num_batches):
+            try:
+                batch = next(it)
+            except StopIteration:
+                break
+            batch_np = numpy_from_torch(batch)
+            support_batches.append(batch_np)
+
+    for i, batch_np in enumerate(tqdm(support_batches, desc="Sampling", unit="batch")):
+        if batch_np is None:
             break
-        batch_np = numpy_from_torch(batch)
         # CRITICAL: Pad/crop batch to fixed batch_size_eval to avoid recompilation
         if batch_np.shape[0] < args.batch_size_eval:
             pad_size = args.batch_size_eval - batch_np.shape[0]
@@ -1382,10 +1398,52 @@ def main():
                     logger.logkv("eval_loss", eval_loss)
                     logger.dumpkvs(global_step)
 
-                    # Generate samples and log to wandb
+                    # Load or create fixed support sets for progression tracking
+                    fixed_support_cache_path = os.path.join(DIR, "fixed_support_sets.npz")
+                    fixed_support_sets = None
+                    
+                    if os.path.exists(fixed_support_cache_path):
+                        # Load cached fixed support sets
+                        try:
+                            cache_data = np.load(fixed_support_cache_path)
+                            fixed_support_sets = cache_data["support_sets"]
+                            logger.log(f"✅ Loaded fixed support sets from cache ({fixed_support_sets.shape[0]} sets)")
+                        except Exception as e:
+                            logger.log(f"⚠️  Could not load fixed support cache: {e}, will create new one")
+                    
+                    if fixed_support_sets is None:
+                        # First time: create and cache fixed support sets
+                        logger.log(f"📝 Creating fixed support sets cache (2 sets for progression tracking)...")
+                        it_temp = iter(val_loader)
+                        temp_batches = []
+                        for i in range(2):  # Only need 2 sets
+                            try:
+                                batch = next(it_temp)
+                                batch_np = numpy_from_torch(batch)
+                                # Pad/crop to batch_size_eval
+                                if batch_np.shape[0] < args.batch_size_eval:
+                                    pad_size = args.batch_size_eval - batch_np.shape[0]
+                                    pad = np.zeros((pad_size,) + batch_np.shape[1:], dtype=batch_np.dtype)
+                                    batch_np = np.concatenate([batch_np, pad], axis=0)
+                                elif batch_np.shape[0] > args.batch_size_eval:
+                                    batch_np = batch_np[:args.batch_size_eval]
+                                # Normalize to cfg.sample_size
+                                batch_np = fix_set_size(jnp.array(batch_np), cfg.sample_size)
+                                batch_np = np.array(batch_np)
+                                temp_batches.append(batch_np)
+                            except StopIteration:
+                                break
+                        
+                        if len(temp_batches) > 0:
+                            fixed_support_sets = np.concatenate(temp_batches, axis=0)[:2]  # Only keep first 2 sets
+                            # Save to cache
+                            np.savez(fixed_support_cache_path, support_sets=fixed_support_sets)
+                            logger.log(f"✅ Cached {fixed_support_sets.shape[0]} fixed support sets for progression tracking")
+                    
+                    # Generate samples using fixed support sets
                     samples, support = sample_loop(
-                        p_state, modules, cfg, val_loader, args.num_sample_batches, rng, args.use_ddim, args.eta, args,
-                        ddim_num_steps=args.ddim_num_steps)
+                        p_state, modules, cfg, val_loader, 2, rng, args.use_ddim, args.eta, args,
+                        ddim_num_steps=args.ddim_num_steps, fixed_support_sets=fixed_support_sets)
 
                     # Initialize log_dict (will be used for both wandb and non-wandb cases)
                     log_dict = {"eval_loss": eval_loss}
@@ -1404,8 +1462,8 @@ def main():
                             # Samples were generated with leave-one-out, so we have ns samples per set
                             samples_per_set = samples.reshape(num_sets, ns, *samples.shape[1:])
                         
-                            # Show first 3 sets with their support and generated samples
-                            num_sets_to_show = min(3, num_sets)
+                            # Show first 2 sets with their support and generated samples (for progression tracking)
+                            num_sets_to_show = min(2, num_sets)
                         
                             for set_idx in range(num_sets_to_show):
                                 # Create a grid: Support images | Generated samples
