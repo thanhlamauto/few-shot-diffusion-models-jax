@@ -514,20 +514,31 @@ def encode_set(
             # Extract patch tokens (skip CLS and TIME tokens)
             # ViT.forward_set always has TIME token (even if t_emb=None, it creates zero token)
             # So offset is always 2: CLS + TIME
-            tokens = x_set_tokens[:, 2:, :]  # (b, np, dim) - patch tokens only (skip CLS=0, TIME=1)
+            tokens_all = x_set_tokens[:, 2:, :]  # (b, np*ns, dim) - all patch tokens concatenated
+            
+            # For ViT with set of images, patches are concatenated: (b, np*ns, dim)
+            # Need to reshape to (b*ns, np, dim) for lag mode
+            patch_size_enc = cfg.encoder_patch_size if cfg.encoder_patch_size > 0 else cfg.patch_size
+            num_patches_per_image = (cfg.image_size // patch_size_enc) ** 2
+            
+            # Reshape: (b, np*ns, dim) -> (b, ns, np, dim) -> (b*ns, np, dim)
+            b_actual = tokens_all.shape[0]
+            total_patches = tokens_all.shape[1]
+            assert total_patches % num_patches_per_image == 0, \
+                f"Total patches ({total_patches}) must be divisible by patches per image ({num_patches_per_image})"
+            ns_actual = total_patches // num_patches_per_image
+            
+            tokens = tokens_all.reshape(b_actual, ns_actual, num_patches_per_image, -1)  # (b, ns, np, dim)
+            tokens = tokens.reshape(b_actual * ns_actual, num_patches_per_image, -1)  # (b*ns, np, dim)
             
             # ASSERT 1-4: Validate token shapes for ViT
-            b_actual = tokens.shape[0]
-            num_patches_actual = tokens.shape[1]
             hdim_actual = tokens.shape[2]
-            patch_size_enc = cfg.encoder_patch_size if cfg.encoder_patch_size > 0 else cfg.patch_size
-            num_patches_expected = (cfg.image_size // patch_size_enc) ** 2
             
             assert tokens.ndim == 3, f"ViT tokens must be 3D, got {tokens.ndim}D"
             assert hdim_actual == cfg.hdim, \
                 f"ViT tokens dim mismatch: got {hdim_actual}, expected {cfg.hdim}"
-            assert num_patches_actual == num_patches_expected, \
-                f"ViT num_patches mismatch: got {num_patches_actual}, expected {num_patches_expected}"
+            assert tokens.shape[1] == num_patches_per_image, \
+                f"ViT num_patches mismatch: got {tokens.shape[1]}, expected {num_patches_per_image}"
             
             return hc, tokens
         else:
