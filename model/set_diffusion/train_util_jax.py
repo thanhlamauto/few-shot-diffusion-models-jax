@@ -201,6 +201,7 @@ def train_step_pmap(
     loss_fn: Callable[[Any, Array, PRNGKey], Dict[str, Array]],
     ema_rate: float = 0.999,
     freeze_dit_steps: int = 0,
+    freeze_encoder_steps: int = 0,
     base_lr: float = 1e-4,
     encoder_lr: Optional[float] = None,
     dit_lr: Optional[float] = None,
@@ -266,6 +267,33 @@ def train_step_pmap(
                 return grad_dict
             
             grads = mask_dit_grads(grads)
+        
+        # Freeze encoder if enabled
+        # freeze_encoder_steps > 0: freeze forever
+        # freeze_encoder_steps < 0: freeze for first |freeze_encoder_steps| steps
+        if freeze_encoder_steps != 0:
+            if freeze_encoder_steps > 0:
+                # Freeze forever
+                should_freeze_encoder = jnp.array(True)
+            else:
+                # Freeze for first N steps (negative value means temporary freeze)
+                should_freeze_encoder = state.step < abs(freeze_encoder_steps)
+            
+            # Create masked gradients: zero out encoder grads if frozen
+            def mask_encoder_grads(grad_dict):
+                if "encoder" in grad_dict:
+                    # Zero out encoder gradients if frozen
+                    encoder_grads_masked = jax.lax.cond(
+                        should_freeze_encoder,
+                        lambda g: jax.tree.map(jnp.zeros_like, g),  # Freeze: zero grads
+                        lambda g: g,  # Normal: keep grads
+                        grad_dict["encoder"]
+                    )
+                    grad_dict_masked = {**grad_dict, "encoder": encoder_grads_masked}
+                    return grad_dict_masked
+                return grad_dict
+            
+            grads = mask_encoder_grads(grads)
         
         # Compute RAW grad norms BEFORE scaling (for comparison)
         def get_norm(tree):
@@ -405,6 +433,7 @@ def train_step_single_device(
     loss_fn: Callable[[Any, Array, PRNGKey], Dict[str, Array]],
     ema_rate: float = 0.999,
     freeze_dit_steps: int = 0,
+    freeze_encoder_steps: int = 0,
 ):
     """
     Returns a JIT-compiled train step for SINGLE DEVICE (no pmap).
@@ -439,6 +468,27 @@ def train_step_single_device(
                 return grad_dict
             
             grads = mask_dit_grads(grads)
+        
+        # Freeze encoder if enabled
+        if freeze_encoder_steps != 0:
+            if freeze_encoder_steps > 0:
+                should_freeze_encoder = jnp.array(True)
+            else:
+                should_freeze_encoder = state.step < abs(freeze_encoder_steps)
+            
+            def mask_encoder_grads(grad_dict):
+                if "encoder" in grad_dict:
+                    encoder_grads_masked = jax.lax.cond(
+                        should_freeze_encoder,
+                        lambda g: jax.tree.map(jnp.zeros_like, g),
+                        lambda g: g,
+                        grad_dict["encoder"]
+                    )
+                    grad_dict_masked = {**grad_dict, "encoder": encoder_grads_masked}
+                    return grad_dict_masked
+                return grad_dict
+            
+            grads = mask_encoder_grads(grads)
         
         updates, new_opt_state = tx.update(grads, state.opt_state, state.params)
         new_params = optax.apply_updates(state.params, updates)

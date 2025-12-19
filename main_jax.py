@@ -746,6 +746,21 @@ def main():
     print(f"🔧 Initializing models...")
     params, modules, cfg = select_model_jax(args, rng_model)
     
+    # Load pretrained encoder weights if specified
+    pretrained_encoder_path = getattr(args, 'pretrained_encoder_path', None)
+    if pretrained_encoder_path:
+        from model.vfsddpm_jax import load_pretrained_encoder_weights
+        print(f"\n{'='*70}")
+        print(f"Loading pretrained encoder weights from: {pretrained_encoder_path}")
+        print(f"{'='*70}")
+        params["encoder"] = load_pretrained_encoder_weights(
+            params["encoder"],
+            pretrained_encoder_path,
+            strict=False,  # Non-strict: only load matching keys
+        )
+        print(f"RSS after loading pretrained encoder: {rss_gb():.2f} GB")
+        print(f"{'='*70}\n")
+    
     # Log VAE info if enabled
     if cfg.use_vae:
         vae = modules.get("vae")
@@ -955,6 +970,19 @@ def main():
         logger.log(f"   Only encoder (+ time_embed + posterior if variational) will train")
         logger.log(f"   DiT will unfreeze at step {freeze_dit_steps + 1}")
         logger.log(f"{'='*70}\n")
+    
+    # Log freeze encoder setting
+    freeze_encoder_steps = getattr(args, 'freeze_encoder_steps', 0)
+    if freeze_encoder_steps != 0:
+        if freeze_encoder_steps > 0:
+            logger.log(f"\n🔒 FREEZE ENCODER MODE ENABLED:")
+            logger.log(f"   Encoder will be FROZEN for the entire training")
+            logger.log(f"   Only DiT (+ time_embed + posterior if variational) will train")
+        else:
+            logger.log(f"\n🔒 FREEZE ENCODER MODE ENABLED:")
+            logger.log(f"   Encoder will be FROZEN for first {abs(freeze_encoder_steps)} steps")
+            logger.log(f"   Encoder will unfreeze at step {abs(freeze_encoder_steps) + 1}")
+        logger.log(f"{'='*70}\n")
 
     # Train state and optimizer
     print(f"🔧 Creating train state...")
@@ -980,12 +1008,14 @@ def main():
         return vfsddpm_loss(rng_in, p, modules, batch, cfg, train=True)
 
     freeze_dit_steps = getattr(args, 'freeze_dit_steps', 0)
+    freeze_encoder_steps = getattr(args, 'freeze_encoder_steps', 0)
     
     if use_single_device:
         print(f"🔧 Creating jit(train_step) [SINGLE DEVICE]...")
         p_train_step = train_step_single_device(
             tx, loss_fn, ema_rate=float(str(args.ema_rate).split(",")[0]),
-            freeze_dit_steps=freeze_dit_steps)
+            freeze_dit_steps=freeze_dit_steps,
+            freeze_encoder_steps=freeze_encoder_steps)
     else:
         print(f"🔧 Creating pmap(train_step)...")
         p_train_step = train_step_pmap(
@@ -993,6 +1023,7 @@ def main():
             loss_fn,
             ema_rate=float(str(args.ema_rate).split(",")[0]),
             freeze_dit_steps=freeze_dit_steps,
+            freeze_encoder_steps=freeze_encoder_steps,
             base_lr=args.lr,
             encoder_lr=args.encoder_lr,
             dit_lr=args.dit_lr,
@@ -1680,6 +1711,8 @@ def create_argparser():
         lr_anneal_steps=0,
         max_steps=0,  # 0 means infinite, set to positive number to limit training
         freeze_dit_steps=0,  # If > 0, freeze DiT for first N steps (only train encoder)
+        pretrained_encoder_path="",  # Path to pretrained encoder weights (.npz file)
+        freeze_encoder_steps=0,  # If > 0, freeze encoder forever; if < 0, freeze for first N steps
         batch_size=16,
         batch_size_eval=16,
         log_interval=100,

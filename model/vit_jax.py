@@ -226,10 +226,9 @@ class ViT(nn.Module):
         if t_emb is None:
             t_tok = jnp.zeros((b, 1, dim), dtype=patches.dtype)
         else:
-            # t_emb: (b, t_dim) -> (b, dim)
+            # t_emb: (b, t_dim) -> (b, dim) -> (b, 1, dim)
             t_tok = self.to_time_embedding(t_emb)  # (b, dim)
-            t_tok = t_tok.reshape(b, ns + 1, -1)
-            t_tok = t_tok[:, 0:1, :]  # (b, 1, dim)
+            t_tok = t_tok[:, None, :]  # (b, 1, dim) - add sequence dimension
 
         # concat cls + t + patches
         x = jnp.concatenate([cls_tokens, t_tok, patches],

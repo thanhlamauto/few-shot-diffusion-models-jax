@@ -368,6 +368,90 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
     return params, modules, cfg
 
 
+def load_pretrained_encoder_weights(
+    encoder_params: Any,
+    pretrained_path: str,
+    strict: bool = False,
+) -> Any:
+    """
+    Load pretrained encoder weights from npz file and merge into encoder_params.
+    
+    Args:
+        encoder_params: Current encoder parameters (from init)
+        pretrained_path: Path to pretrained weights npz file
+        strict: If True, raise error if keys don't match. If False, only load matching keys.
+    
+    Returns:
+        Updated encoder_params with pretrained weights loaded
+    """
+    import numpy as np
+    import os
+    import sys
+    
+    # Try to import from convert script (might not exist)
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from convert_vit_pytorch_to_jax import unflatten_dict
+    except ImportError:
+        # Fallback: define unflatten_dict locally
+        def unflatten_dict(flat_dict, sep='/'):
+            """Reconstruct nested dict from flattened dict"""
+            result = {}
+            for key, value in flat_dict.items():
+                parts = key.split(sep)
+                d = result
+                for part in parts[:-1]:
+                    if part not in d:
+                        d[part] = {}
+                    d = d[part]
+                d[parts[-1]] = value
+            return result
+    
+    print(f"Loading pretrained encoder weights from: {pretrained_path}")
+    
+    # Load pretrained weights
+    pretrained_data = np.load(pretrained_path, allow_pickle=True)
+    flat_pretrained = {k: v for k, v in pretrained_data.items()}
+    
+    # Unflatten to nested structure
+    pretrained_nested = unflatten_dict(flat_pretrained)
+    
+    # Extract encoder params from pretrained (might be under 'params' key)
+    if 'params' in pretrained_nested:
+        pretrained_encoder = pretrained_nested['params']
+    else:
+        pretrained_encoder = pretrained_nested
+    
+    # Function to recursively update params
+    def update_params(current, pretrained, path=""):
+        if isinstance(current, dict) and isinstance(pretrained, dict):
+            updated = {}
+            for key in current.keys():
+                current_path = f"{path}.{key}" if path else key
+                if key in pretrained:
+                    updated[key] = update_params(current[key], pretrained[key], current_path)
+                else:
+                    if strict:
+                        raise KeyError(f"Key '{current_path}' not found in pretrained weights")
+                    else:
+                        print(f"Warning: Key '{current_path}' not found in pretrained weights, keeping initialized value")
+                        updated[key] = current[key]
+            return updated
+        else:
+            # Leaf node: replace with pretrained value
+            if strict and current.shape != pretrained.shape:
+                raise ValueError(f"Shape mismatch at {path}: {current.shape} vs {pretrained.shape}")
+            elif current.shape != pretrained.shape:
+                print(f"Warning: Shape mismatch at {path}: {current.shape} vs {pretrained.shape}, skipping")
+                return current
+            return pretrained
+    
+    updated_params = update_params(encoder_params, pretrained_encoder)
+    print("✅ Pretrained encoder weights loaded successfully")
+    
+    return updated_params
+
+
 def encode_set(
     params_enc: Any,
     encoder: nn.Module,
