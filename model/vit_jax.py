@@ -140,8 +140,8 @@ class ViT(nn.Module):
         self.cls_norm = nn.LayerNorm()
         self.cls_dense = nn.Dense(self.num_classes)
         
-        # embedding dropout layer
-        self.emb_dropout_layer = nn.Dropout(self.emb_dropout)
+        # embedding dropout layer (khai báo với rate)
+        self.emb_dropout_layer = nn.Dropout(rate=self.emb_dropout)
 
     # tương đương forward(self, img)
     def __call__(self, img, train: bool = True):
