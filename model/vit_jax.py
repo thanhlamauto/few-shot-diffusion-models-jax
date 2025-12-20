@@ -97,6 +97,8 @@ class ViT(nn.Module):
     ns: int = 1
     t_dim: int = 256
     hierarchical_patch_embedding: bool = False  # chưa dùng, chỉ để tương thích
+    use_mlp_head: bool = False  # Sử dụng MLP head thay vì chỉ 1 Dense layer
+    mlp_head_hidden_dim: int = 512  # Hidden dimension cho MLP head
 
     def setup(self):
         ih, iw = pair(self.image_size)
@@ -136,10 +138,22 @@ class ViT(nn.Module):
             attn_dropout=self.dropout,
         )
 
-        # head
+        # head - LayerNorm + MLP hoặc Dense
         self.cls_norm = nn.LayerNorm()
-        self.cls_dense = nn.Dense(self.num_classes)
-        
+
+        if self.use_mlp_head:
+            # MLP head: Dense -> GELU -> Dropout -> Dense
+            self.mlp_head = FeedForward(
+                
+
+                dim=self.num_classes,
+                hidden_dim=self.mlp_head_hidden_dim,
+                dropout=self.dropout
+            )
+        else:
+            # Single Dense layer (original)
+            self.cls_dense = nn.Dense(self.num_classes)
+
         # embedding dropout layer (khai báo với rate)
         self.emb_dropout_layer = nn.Dropout(self.emb_dropout)
 
@@ -173,7 +187,10 @@ class ViT(nn.Module):
             x = x_set[:, 0]
 
         x = self.cls_norm(x)
-        x = self.cls_dense(x)
+        if self.use_mlp_head:
+            x = self.mlp_head(x, train=train)
+        else:
+            x = self.cls_dense(x)
         return x
 
     # tương đương forward_set(self, img, t_emb=None, c_old=None)
@@ -277,7 +294,7 @@ class ViT(nn.Module):
             else:  # 'none' -> trả nguyên token
                 x_out = x_set
 
-        # head giống bản PyTorch (LayerNorm + Linear)
+        # head: LayerNorm + MLP (hoặc Dense)
         if x_out.ndim == 3:
             # nếu là token map (b, n, dim) thì dùng mean
             x_vec = x_out.mean(axis=1)
@@ -287,7 +304,11 @@ class ViT(nn.Module):
         x_vec = self.cls_norm(x_vec)
         if c_old is not None:
             x_vec = x_vec + c_old
-        hc = self.cls_dense(x_vec)
+
+        if self.use_mlp_head:
+            hc = self.mlp_head(x_vec, train=train)
+        else:
+            hc = self.cls_dense(x_vec)
 
         # Return tuple instead of dict for JAX tracing compatibility
         return hc, x_set, x_set[:, 0]

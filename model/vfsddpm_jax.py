@@ -97,6 +97,9 @@ class VFSDDPMConfig:
     encoder_dim_head: int = 56
     encoder_mlp_ratio: float = 1.0  # mlp_dim = int(hdim * encoder_mlp_ratio)
     encoder_tokenize_mode: str = "stack"  # for sViT: "stack" | "per_sample_mean"
+    # Encoder output head configuration
+    encoder_use_mlp_head: bool = False  # Use MLP head (LayerNorm + MLP) instead of single Dense layer
+    encoder_mlp_head_hidden_dim: int = 512  # Hidden dimension for MLP head (if enabled)
     # DiT
     hidden_size: int = 768
     depth: int = 12
@@ -149,6 +152,8 @@ def build_encoder(cfg: VFSDDPMConfig) -> nn.Module:
             ns=1,
             dropout=cfg.dropout,
             emb_dropout=cfg.dropout,
+            use_mlp_head=cfg.encoder_use_mlp_head,
+            mlp_head_hidden_dim=cfg.encoder_mlp_head_hidden_dim,
         )
     return sViT(
         image_size=(cfg.image_size, cfg.image_size),
@@ -167,6 +172,8 @@ def build_encoder(cfg: VFSDDPMConfig) -> nn.Module:
         dropout=cfg.dropout,
         emb_dropout=cfg.dropout,
         tokenize_mode=cfg.encoder_tokenize_mode,
+        use_mlp_head=cfg.encoder_use_mlp_head,
+        mlp_head_hidden_dim=cfg.encoder_mlp_head_hidden_dim,
     )
 
 

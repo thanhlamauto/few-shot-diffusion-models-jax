@@ -26,6 +26,8 @@ def select_model_jax(args, rng: jax.Array) -> Tuple[Dict[str, Any], Dict[str, An
         encoder_dim_head=getattr(args, "encoder_dim_head", 56),
         encoder_mlp_ratio=getattr(args, "encoder_mlp_ratio", 1.0),
         encoder_tokenize_mode=getattr(args, "encoder_tokenize_mode", "stack"),
+        encoder_use_mlp_head=getattr(args, "encoder_use_mlp_head", False),
+        encoder_mlp_head_hidden_dim=getattr(args, "encoder_mlp_head_hidden_dim", 512),
         hidden_size=args.hidden_size,
         depth=args.depth,
         num_heads=args.num_heads,

@@ -245,6 +245,10 @@ class sViT(nn.Module):
     # FIX D: chọn tokenization mode
     tokenize_mode: Literal["stack", "per_sample_mean"] = "stack"
 
+    # Encoder output head configuration
+    use_mlp_head: bool = False  # Use MLP head (LayerNorm + MLP) instead of single Dense layer
+    mlp_head_hidden_dim: int = 512  # Hidden dimension for MLP head (if enabled)
+
     def setup(self):
         image_height, image_width = pair(self.image_size)
         patch_height, patch_width = pair(self.patch_size)
@@ -293,9 +297,19 @@ class sViT(nn.Module):
             dropout=self.dropout,
         )
 
-        # giống PyTorch: mlp_head = LayerNorm + Linear
+        # head: LayerNorm + MLP (hoặc Dense)
         self.mlp_norm = nn.LayerNorm()
-        self.mlp_dense = nn.Dense(self.num_classes)
+
+        if self.use_mlp_head:
+            # MLP head: Dense -> GELU -> Dropout -> Dense
+            self.mlp_head_ff = FeedForward(
+                dim=self.num_classes,
+                hidden_dim=self.mlp_head_hidden_dim,
+                dropout=self.dropout
+            )
+        else:
+            # Single Dense layer (original)
+            self.mlp_dense = nn.Dense(self.num_classes)
 
         self.to_time_embedding = nn.Dense(self.dim)
 
@@ -322,7 +336,10 @@ class sViT(nn.Module):
             x = x[:, 0]
 
         x = self.mlp_norm(x)
-        x = self.mlp_dense(x)
+        if self.use_mlp_head:
+            x = self.mlp_head_ff(x, train=train)
+        else:
+            x = self.mlp_dense(x)
         return x
 
     def forward_set(
@@ -397,6 +414,9 @@ class sViT(nn.Module):
             x_out = x_out + c_old
 
         x_out = self.mlp_norm(x_out)
-        hc = self.mlp_dense(x_out)
+        if self.use_mlp_head:
+            hc = self.mlp_head_ff(x_out, train=train)
+        else:
+            hc = self.mlp_dense(x_out)
 
         return hc, x_set, x_set[:, 0]

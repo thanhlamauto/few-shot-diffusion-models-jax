@@ -1727,6 +1727,9 @@ def create_argparser():
         encoder_dim_head=56,
         encoder_mlp_ratio=1.0,
         encoder_tokenize_mode="stack",  # "stack" | "per_sample_mean"
+        # Encoder output head configuration
+        encoder_use_mlp_head=False,  # Use MLP head (LayerNorm + MLP) instead of single Dense layer
+        encoder_mlp_head_hidden_dim=512,  # Hidden dimension for MLP head (if enabled)
         context_channels=448,  # Match with hidden_size (must be divisible by 4)
         mode_context="deterministic",
         mode_conditioning="film",
