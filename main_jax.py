@@ -1391,21 +1391,40 @@ def main():
                                 else:
                                     # Multi-device: batch_sharded is a sharded array, need to get first device's data
                                     # Use device_get to properly extract data from the sharded array
-                                    batch_vis_list = jax.device_get(batch_sharded)
-                                    if isinstance(batch_vis_list, list):
-                                        batch_vis = batch_vis_list[0] if len(batch_vis_list) > 0 else batch_sharded
+                                    batch_vis_raw = jax.device_get(batch_sharded)
+                                    
+                                    # Handle different return types from device_get
+                                    if isinstance(batch_vis_raw, list):
+                                        # List of arrays (one per device)
+                                        batch_vis = batch_vis_raw[0] if len(batch_vis_raw) > 0 else None
+                                    elif isinstance(batch_vis_raw, np.ndarray):
+                                        # Single array - check if it's 6D (n_devices, per_device_bs, ns, C, H, W)
+                                        if len(batch_vis_raw.shape) == 6:
+                                            # Extract first device's data: (n_devices, per_device_bs, ns, C, H, W) -> (per_device_bs, ns, C, H, W)
+                                            batch_vis = batch_vis_raw[0]
+                                        elif len(batch_vis_raw.shape) == 5:
+                                            # Already 5D, take first per_device_bs samples
+                                            per_device_bs = batch_jnp.shape[0] // n_devices
+                                            batch_vis = batch_vis_raw[:per_device_bs]
+                                        else:
+                                            # Unexpected shape, try to use as-is
+                                            batch_vis = batch_vis_raw
                                     else:
-                                        # If device_get returns array directly, take first slice along batch dim
-                                        # Shape should be (total_bs, ns, C, H, W), so take first per_device_bs samples
-                                        per_device_bs = batch_jnp.shape[0] // n_devices
-                                        batch_vis = batch_vis_list[:per_device_bs]
+                                        # Fallback: try to convert
+                                        batch_vis = np.array(batch_vis_raw)
+                                    
+                                    # Convert to numpy if needed
+                                    if not isinstance(batch_vis, np.ndarray):
+                                        batch_vis = np.array(batch_vis)
                                 
                                 # Log batch shape for debugging
                                 logger.log(f"Batch shape for visualization: {batch_vis.shape}")
                                 
                                 # Validate shape
                                 if len(batch_vis.shape) != 5:
-                                    raise ValueError(f"Expected (bs, ns, C, H, W), got shape {batch_vis.shape}")
+                                    raise ValueError(f"Expected (bs, ns, C, H, W), got shape {batch_vis.shape}. "
+                                                   f"Original batch_jnp shape: {batch_jnp.shape}, "
+                                                   f"n_devices: {n_devices}")
                                 
                                 # Create visualization figures
                                 figs = visualize_support_target_split(
