@@ -205,7 +205,8 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta, 
     # Use fixed support sets if provided, otherwise load from loader
     if fixed_support_sets is not None:
         # Use provided fixed support sets
-        support_batches = [fixed_support_sets[i] for i in range(min(num_batches, len(fixed_support_sets)))]
+        # Keep batch dimension: fixed_support_sets[i:i+1] has shape (1, ns, C, H, W)
+        support_batches = [fixed_support_sets[i:i+1] for i in range(min(num_batches, len(fixed_support_sets)))]
     else:
         # Load from loader
         it = iter(loader)
@@ -216,6 +217,10 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta, 
             except StopIteration:
                 break
             batch_np = numpy_from_torch(batch)
+            # Validate that batch has correct shape (should be 5D: bs, ns, C, H, W)
+            if len(batch_np.shape) != 5:
+                raise ValueError(f"Expected batch from loader to have 5 dimensions (bs, ns, C, H, W), got shape {batch_np.shape} with {len(batch_np.shape)} dimensions. "
+                               f"This may indicate the dataset loader is returning incorrect format.")
             support_batches.append(batch_np)
 
     for i, batch_np in enumerate(tqdm(support_batches, desc="Sampling", unit="batch")):
@@ -234,6 +239,10 @@ def sample_loop(p_state, modules, cfg, loader, num_batches, rng, use_ddim, eta, 
         from model.vfsddpm_jax import fix_set_size
         batch_np = fix_set_size(jnp.array(batch_np), cfg.sample_size)
         batch_np = np.array(batch_np)  # Convert back to numpy
+        
+        # Validate shape before unpacking
+        if len(batch_np.shape) != 5:
+            raise ValueError(f"Expected batch_np shape (b, ns, c, h, w) with 5 dimensions, got shape {batch_np.shape} with {len(batch_np.shape)} dimensions")
         b, ns, c, h, w = batch_np.shape
         # Now ns == cfg.sample_size guaranteed
         rng, sub = jax.random.split(rng)
@@ -1493,6 +1502,9 @@ def main():
                                 # Normalize to cfg.sample_size
                                 batch_np = fix_set_size(jnp.array(batch_np), cfg.sample_size)
                                 batch_np = np.array(batch_np)
+                                # Validate shape before appending
+                                if len(batch_np.shape) != 5:
+                                    raise ValueError(f"Expected batch_np shape (b, ns, c, h, w) with 5 dimensions, got shape {batch_np.shape} with {len(batch_np.shape)} dimensions")
                                 temp_batches.append(batch_np)
                             except StopIteration:
                                 break
