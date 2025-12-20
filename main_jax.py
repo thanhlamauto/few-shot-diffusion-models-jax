@@ -394,7 +394,14 @@ def compute_fid_mixture(p_state, modules, cfg, dataset_split, n_samples, rng, us
     class_usage = {cid: 0 for cid in unique_classes}
     
     ema_params = flax.jax_utils.unreplicate(p_state.ema_params)
-    C, H, W = dataset.data['inputs'].shape[2], dataset.data['inputs'].shape[3], dataset.data['inputs'].shape[4]
+    # Handle both 5D (n_sets, ns, C, H, W) and 4D (n_sets*ns, C, H, W) shapes
+    inputs_shape = dataset.data['inputs'].shape
+    if len(inputs_shape) == 5:
+        C, H, W = inputs_shape[2], inputs_shape[3], inputs_shape[4]
+    elif len(inputs_shape) == 4:
+        C, H, W = inputs_shape[1], inputs_shape[2], inputs_shape[3]
+    else:
+        raise ValueError(f"Unexpected dataset.data['inputs'] shape: {inputs_shape}, expected 4D or 5D")
     
     pbar = tqdm(total=n_samples, desc=f"{dist_name}-dist generation", unit="images")
     
@@ -1154,11 +1161,12 @@ def main():
             fid_mode = getattr(args, 'fid_mode', 'in')
             
             if fid_mode == "per_class":
-                print(f"\nComputing per-class FID at step 0...")
-                fid_result = compute_fid_per_class(
-                    p_state, modules, cfg, val_dataset,
-                    args.fid_num_samples, rng, args.use_ddim, args.eta, inception_fn
-                )
+                print(f"\n⚠️  per_class FID mode not implemented, skipping...")
+                fid_result = None
+                # fid_result = compute_fid_per_class(
+                #     p_state, modules, cfg, val_dataset,
+                #     args.fid_num_samples, rng, args.use_ddim, args.eta, inception_fn
+                # )
                 if fid_result is not None and isinstance(fid_result, tuple):
                     fid_score, class_info = fid_result
                     print(f"\n✅ Final FID Score: {fid_score:.2f}")
@@ -1578,12 +1586,13 @@ def main():
                         fid_mode = getattr(args, 'fid_mode', 'in')
                         
                         if fid_mode == "per_class":
-                            # Legacy per-class FID
-                            print(f"\nComputing per-class FID at step {global_step}...")
-                            fid_result = compute_fid_per_class(
-                                p_state, modules, cfg, val_dataset,
-                                args.fid_num_samples, rng, args.use_ddim, args.eta, inception_fn
-                            )
+                            # Legacy per-class FID (not implemented)
+                            print(f"\n⚠️  per_class FID mode not implemented, skipping...")
+                            fid_result = None
+                            # fid_result = compute_fid_per_class(
+                            #     p_state, modules, cfg, val_dataset,
+                            #     args.fid_num_samples, rng, args.use_ddim, args.eta, inception_fn
+                            # )
                             
                             if fid_result is not None:
                                 if isinstance(fid_result, tuple):
