@@ -1376,8 +1376,20 @@ def main():
                         if args.log_support_target:
                             try:
                                 # Get unsharded batch for visualization (first device)
-                                # batch_sharded can be: (n_devices, bs_per_device, ns, C, H, W)
-                                batch_vis = batch_sharded[0] if isinstance(batch_sharded, (list, tuple)) or len(batch_sharded.shape) == 6 else batch_sharded
+                                if use_single_device:
+                                    # Single device: batch_sharded is already (bs, ns, C, H, W)
+                                    batch_vis = batch_sharded
+                                else:
+                                    # Multi-device: batch_sharded is a sharded array, need to get first device's data
+                                    # Use device_get to properly extract data from the sharded array
+                                    batch_vis_list = jax.device_get(batch_sharded)
+                                    if isinstance(batch_vis_list, list):
+                                        batch_vis = batch_vis_list[0] if len(batch_vis_list) > 0 else batch_sharded
+                                    else:
+                                        # If device_get returns array directly, take first slice along batch dim
+                                        # Shape should be (total_bs, ns, C, H, W), so take first per_device_bs samples
+                                        per_device_bs = batch_jnp.shape[0] // n_devices
+                                        batch_vis = batch_vis_list[:per_device_bs]
                                 
                                 # Log batch shape for debugging
                                 logger.log(f"Batch shape for visualization: {batch_vis.shape}")
