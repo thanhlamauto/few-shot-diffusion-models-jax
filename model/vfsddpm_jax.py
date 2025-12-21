@@ -69,6 +69,59 @@ class TimeEmbed(nn.Module):
         return x
 
 
+class MLPProjection(nn.Module):
+    """
+    3-layer MLP projection head for adapting pretrained encoder features.
+
+    Used when loading pretrained weights and freezing encoder to learn
+    a projection from pretrained feature space to FSDM context space.
+
+    Architecture:
+        input_dim -> hidden_dim -> hidden_dim -> output_dim
+        with GELU activation and dropout after each layer
+
+    Args:
+        input_dim: Input feature dimension (from pretrained encoder)
+        output_dim: Output dimension (context_channels for FSDM)
+        hidden_dim: Hidden layer dimension (default: same as output_dim)
+        dropout_rate: Dropout probability (default: 0.0)
+    """
+    input_dim: int
+    output_dim: int
+    hidden_dim: Optional[int] = None
+    dropout_rate: float = 0.0
+
+    @nn.compact
+    def __call__(self, x: Array, train: bool = True) -> Array:
+        """
+        Args:
+            x: Input features (batch, input_dim) or (batch, seq_len, input_dim)
+            train: Whether in training mode (for dropout)
+
+        Returns:
+            Projected features (batch, output_dim) or (batch, seq_len, output_dim)
+        """
+        hidden_dim = self.hidden_dim if self.hidden_dim is not None else self.output_dim
+
+        # Layer 1: input_dim -> hidden_dim
+        x = nn.Dense(hidden_dim, kernel_init=nn.initializers.xavier_uniform())(x)
+        x = nn.gelu(x)
+        if self.dropout_rate > 0:
+            x = nn.Dropout(self.dropout_rate)(x, deterministic=not train)
+
+        # Layer 2: hidden_dim -> hidden_dim
+        x = nn.Dense(hidden_dim, kernel_init=nn.initializers.xavier_uniform())(x)
+        x = nn.gelu(x)
+        if self.dropout_rate > 0:
+            x = nn.Dropout(self.dropout_rate)(x, deterministic=not train)
+
+        # Layer 3: hidden_dim -> output_dim
+        x = nn.Dense(self.output_dim, kernel_init=nn.initializers.xavier_uniform())(x)
+        # No activation or dropout on final layer (standard practice)
+
+        return x
+
+
 @dataclasses.dataclass
 class VFSDDPMConfig:
     # data
@@ -100,6 +153,9 @@ class VFSDDPMConfig:
     # Encoder output head configuration
     encoder_use_mlp_head: bool = False  # Use MLP head (LayerNorm + MLP) instead of single Dense layer
     encoder_mlp_head_hidden_dim: int = 512  # Hidden dimension for MLP head (if enabled)
+    # Projection head for pretrained encoder adaptation
+    use_projection_head: bool = False  # Automatically enabled when loading pretrained + freeze
+    projection_hidden_dim: int = 0  # Hidden dim for projection (0 = same as context_channels)
     # DiT
     hidden_size: int = 768
     depth: int = 12
@@ -364,6 +420,43 @@ def init_models(rng: PRNGKey, cfg: VFSDDPMConfig):
     params["time_embed"] = time_embed_params
     modules["time_embed"] = time_embed
 
+    # --- Projection head (when using pretrained + freeze encoder) ---
+    if cfg.use_projection_head:
+        projection_hidden_dim = cfg.projection_hidden_dim if cfg.projection_hidden_dim > 0 else cfg.context_channels
+        projection = MLPProjection(
+            input_dim=cfg.hdim,
+            output_dim=cfg.context_channels,
+            hidden_dim=projection_hidden_dim,
+            dropout_rate=cfg.dropout
+        )
+        rng, rng_proj = jax.random.split(rng)
+        # Dummy input: encoder output shape
+        # For film mode: (batch, hdim)
+        # For lag mode: (batch, num_patches, hdim)
+        if cfg.mode_conditioning == "lag":
+            patch_size_enc = cfg.encoder_patch_size if cfg.encoder_patch_size > 0 else cfg.patch_size
+            num_patches = (cfg.image_size // patch_size_enc) ** 2
+            dummy_proj_in = jnp.zeros((1, num_patches, cfg.hdim), dtype=jnp.float32)
+        else:
+            dummy_proj_in = jnp.zeros((1, cfg.hdim), dtype=jnp.float32)
+
+        proj_params = projection.init(rng_proj, dummy_proj_in, train=False)
+        params["projection"] = proj_params
+        modules["projection"] = projection
+
+        print(f"\n{'='*70}")
+        print(f"📦 Projection Head Initialized:")
+        print(f"  Input dim: {cfg.hdim}")
+        print(f"  Hidden dim: {projection_hidden_dim}")
+        print(f"  Output dim: {cfg.context_channels}")
+        print(f"  Dropout: {cfg.dropout}")
+        print(f"  Mode: {cfg.mode_conditioning}")
+        if cfg.mode_conditioning == "lag":
+            print(f"  Shape: (batch, {num_patches}, hdim) → (batch, {num_patches}, {cfg.context_channels})")
+        else:
+            print(f"  Shape: (batch, hdim) → (batch, {cfg.context_channels})")
+        print(f"{'='*70}\n")
+
     if cfg.mode_context == "variational":
         posterior = PosteriorGaussian(cfg.hdim)
         rng_post = jax.random.split(rng, 1)[0]
@@ -382,19 +475,23 @@ def load_pretrained_encoder_weights(
 ) -> Any:
     """
     Load pretrained encoder weights from npz file and merge into encoder_params.
-    
+
+    Handles conversion from PyTorch pretrained ViT:
+    - Conv2d patch_embed → Dense to_patch_embedding
+    - Pads pos_embedding if pretrained has k=1 (only cls) and current has k=2 (cls+time)
+
     Args:
         encoder_params: Current encoder parameters (from init)
         pretrained_path: Path to pretrained weights npz file
         strict: If True, raise error if keys don't match. If False, only load matching keys.
-    
+
     Returns:
         Updated encoder_params with pretrained weights loaded
     """
     import numpy as np
     import os
     import sys
-    
+
     # Try to import from convert script (might not exist)
     try:
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -413,22 +510,77 @@ def load_pretrained_encoder_weights(
                     d = d[part]
                 d[parts[-1]] = value
             return result
-    
+
+    print(f"\n{'='*70}")
     print(f"Loading pretrained encoder weights from: {pretrained_path}")
-    
+    print(f"{'='*70}")
+
     # Load pretrained weights
     pretrained_data = np.load(pretrained_path, allow_pickle=True)
     flat_pretrained = {k: v for k, v in pretrained_data.items()}
-    
+
     # Unflatten to nested structure
     pretrained_nested = unflatten_dict(flat_pretrained)
-    
+
     # Extract encoder params from pretrained (might be under 'params' key)
     if 'params' in pretrained_nested:
         pretrained_encoder = pretrained_nested['params']
     else:
         pretrained_encoder = pretrained_nested
-    
+
+    # Convert Conv2d patch_embed.proj → Dense to_patch_embedding
+    def convert_conv2d_to_dense(weight_conv):
+        """
+        Convert Conv2d weights to Dense weights.
+
+        Conv2d: (out_channels, in_channels, kernel_h, kernel_w)
+        Dense: (in_channels * kernel_h * kernel_w, out_channels)
+
+        Example:
+          Conv2d: (192, 3, 4, 4) → Dense: (48, 192)
+        """
+        if len(weight_conv.shape) == 4:  # Conv2d weight
+            out_c, in_c, kh, kw = weight_conv.shape
+            # Reshape: (out_c, in_c*kh*kw) → transpose → (in_c*kh*kw, out_c)
+            weight_dense = weight_conv.reshape(out_c, -1).T
+            print(f"  ✓ Converted Conv2d {weight_conv.shape} → Dense {weight_dense.shape}")
+            return weight_dense
+        else:
+            return weight_conv
+
+    # Check and convert patch embedding if it's Conv2d
+    if 'to_patch_embedding' in pretrained_encoder:
+        if 'kernel' in pretrained_encoder['to_patch_embedding']:
+            conv_weight = pretrained_encoder['to_patch_embedding']['kernel']
+            if len(conv_weight.shape) == 4:
+                print(f"\n📦 Converting patch_embed from Conv2d to Dense:")
+                pretrained_encoder['to_patch_embedding']['kernel'] = convert_conv2d_to_dense(conv_weight)
+
+    # Pad pos_embedding if needed (pretrained k=1, current k=2)
+    if 'pos_embedding' in pretrained_encoder:
+        pretrained_pos = pretrained_encoder['pos_embedding']
+        if 'params' in encoder_params and 'pos_embedding' in encoder_params['params']:
+            current_pos = encoder_params['params']['pos_embedding']
+
+            # Check shapes: (1, num_patches + k, dim)
+            if pretrained_pos.shape[1] < current_pos.shape[1]:
+                print(f"\n🔧 Padding pos_embedding:")
+                print(f"  Pretrained shape: {pretrained_pos.shape} (k={pretrained_pos.shape[1] - 64})")
+                print(f"  Current shape: {current_pos.shape} (k={current_pos.shape[1] - 64})")
+
+                # Split: cls_pos | (missing time_pos) | patch_pos
+                cls_pos = pretrained_pos[:, :1, :]  # (1, 1, dim)
+                patch_pos = pretrained_pos[:, 1:, :]  # (1, num_patches, dim)
+
+                # Initialize time_pos as zeros
+                dim = pretrained_pos.shape[2]
+                time_pos = jnp.zeros((1, 1, dim), dtype=pretrained_pos.dtype)
+
+                # Concatenate: cls + time + patches
+                padded_pos = jnp.concatenate([cls_pos, time_pos, patch_pos], axis=1)
+                pretrained_encoder['pos_embedding'] = padded_pos
+                print(f"  ✓ Padded to {padded_pos.shape} (added time token position)")
+
     # Function to recursively update params
     def update_params(current, pretrained, path=""):
         if isinstance(current, dict) and isinstance(pretrained, dict):
@@ -441,7 +593,7 @@ def load_pretrained_encoder_weights(
                     if strict:
                         raise KeyError(f"Key '{current_path}' not found in pretrained weights")
                     else:
-                        print(f"Warning: Key '{current_path}' not found in pretrained weights, keeping initialized value")
+                        print(f"⚠️  Key '{current_path}' not found in pretrained weights, keeping initialized value")
                         updated[key] = current[key]
             return updated
         else:
@@ -449,13 +601,14 @@ def load_pretrained_encoder_weights(
             if strict and current.shape != pretrained.shape:
                 raise ValueError(f"Shape mismatch at {path}: {current.shape} vs {pretrained.shape}")
             elif current.shape != pretrained.shape:
-                print(f"Warning: Shape mismatch at {path}: {current.shape} vs {pretrained.shape}, skipping")
+                print(f"⚠️  Shape mismatch at {path}: {current.shape} vs {pretrained.shape}, skipping")
                 return current
             return pretrained
-    
+
     updated_params = update_params(encoder_params, pretrained_encoder)
-    print("✅ Pretrained encoder weights loaded successfully")
-    
+    print(f"\n✅ Pretrained encoder weights loaded successfully")
+    print(f"{'='*70}\n")
+
     return updated_params
 
 
@@ -468,19 +621,36 @@ def encode_set(
     t_emb: Optional[Array] = None,
     return_tokens: bool = False,
     rng: Optional[PRNGKey] = None,
+    # Projection head parameters (for pretrained + freeze)
+    params_proj: Optional[Any] = None,
+    projection: Optional[MLPProjection] = None,
 ) -> Union[Array, Tuple[Array, Array]]:
     """
     Encode a set (or single image) into a set-level representation hc.
-    
+
     Args:
         t_emb: Optional timestep embedding (b*ns, t_dim)
                If provided, encoder becomes time-aware
         return_tokens: If True and mode_conditioning=="lag", also return patch tokens
                       Returns (hc, tokens) tuple instead of just hc
+        params_proj: Projection head parameters (if using pretrained + freeze)
+        projection: Projection head module (if using pretrained + freeze)
     Returns:
-        hc: (b, hdim) pooled representation
-        tokens: (b, num_patches, hdim) patch tokens (only if return_tokens=True and lag mode)
+        hc: (b, context_channels) pooled representation (after projection if enabled)
+        tokens: (b, num_patches, context_channels) patch tokens (after projection if enabled)
+                (only if return_tokens=True and lag mode)
     """
+    # Helper function to apply projection if enabled
+    def apply_projection(features: Array, train: bool) -> Array:
+        """Apply projection head if provided"""
+        if projection is not None and params_proj is not None:
+            proj_kwargs = {"train": train}
+            if train and cfg.dropout > 0 and rng is not None:
+                proj_rng, _ = jax.random.split(rng)
+                proj_kwargs["rngs"] = {"dropout": proj_rng}
+            return projection.apply(params_proj, features, **proj_kwargs)
+        return features
+
     # DEBUG: Log encode_set call (only first call)
     if not hasattr(encode_set, "_logged"):
         import sys
@@ -491,6 +661,7 @@ def encode_set(
         print(f"  - encoder_mode: {cfg.encoder_mode}", file=sys.stderr)
         print(f"  - mode_conditioning: {cfg.mode_conditioning}", file=sys.stderr)
         print(f"  - return_tokens: {return_tokens}", file=sys.stderr)
+        print(f"  - projection: {'Enabled' if projection is not None else 'Disabled'}", file=sys.stderr)
         encode_set._logged = True
     
     if cfg.encoder_mode == "vit":
@@ -546,8 +717,12 @@ def encode_set(
                 f"ViT tokens dim mismatch: got {hdim_actual}, expected {cfg.hdim}"
             assert tokens.shape[1] == num_patches_per_image, \
                 f"ViT num_patches mismatch: got {tokens.shape[1]}, expected {num_patches_per_image}"
-            
-            return hc, tokens
+
+            # Apply projection if enabled
+            hc_proj = apply_projection(hc, train)
+            tokens_proj = apply_projection(tokens, train)
+
+            return hc_proj, tokens_proj
         else:
             # Use forward_set but don't return tokens
             apply_kwargs = {
@@ -561,7 +736,11 @@ def encode_set(
             )
             if hc.ndim == 3:
                 hc = hc.mean(axis=1)
-            return hc
+
+            # Apply projection if enabled
+            hc_proj = apply_projection(hc, train)
+
+            return hc_proj
     else:
         # encoder returns (hc, patches, cls) for forward_set
         # Must explicitly call forward_set method (apply() defaults to __call__)
@@ -605,10 +784,17 @@ def encode_set(
                 print(f"  - tokens shape: {tokens.shape}", file=sys.stderr)
                 print(f"  - Expected num_patches: {num_patches_expected}", file=sys.stderr)
                 encode_set._logged_tokens = True
-            
-            return hc, tokens
-        
-        return hc
+
+            # Apply projection if enabled
+            hc_proj = apply_projection(hc, train)
+            tokens_proj = apply_projection(tokens, train)
+
+            return hc_proj, tokens_proj
+
+        # Apply projection if enabled
+        hc_proj = apply_projection(hc, train)
+
+        return hc_proj
 
 
 def sample_context(
@@ -795,6 +981,8 @@ def leave_one_out_c(
                 t_emb=t_emb_subset,
                 return_tokens=True,
                 rng=key_i,
+                params_proj=params.get("projection"),
+                projection=modules.get("projection"),
             )
             # tokens: (b*ns, num_patches, hdim) from encode_set
             # Reshape to (b, ns, num_patches, hdim) and extract tokens for image i
@@ -817,6 +1005,8 @@ def leave_one_out_c(
                 t_emb=t_emb_subset,
                 return_tokens=False,
                 rng=key_i,
+                params_proj=params.get("projection"),
+                projection=modules.get("projection"),
             )
         
         # Apply posterior if variational (works on pooled hc ONLY, not tokens)

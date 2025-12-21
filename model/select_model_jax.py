@@ -13,6 +13,22 @@ def select_model_jax(args, rng: jax.Array) -> Tuple[Dict[str, Any], Dict[str, An
     if args.model != "vfsddpm_jax":
         raise ValueError(f"Unsupported JAX model: {args.model}")
 
+    # Auto-enable projection head when loading pretrained + freeze encoder
+    pretrained_encoder_path = getattr(args, 'pretrained_encoder_path', '')
+    freeze_encoder_steps = getattr(args, 'freeze_encoder_steps', 0)
+    use_projection_head = pretrained_encoder_path and freeze_encoder_steps > 0
+    projection_hidden_dim = getattr(args, 'projection_hidden_dim', 0)
+
+    if use_projection_head:
+        print(f"\n{'='*70}")
+        print(f"🔧 AUTO-ENABLING PROJECTION HEAD:")
+        print(f"  Reason: Pretrained encoder + freeze detected")
+        print(f"  Pretrained path: {pretrained_encoder_path}")
+        print(f"  Freeze steps: {freeze_encoder_steps}")
+        print(f"  Projection: 3-layer MLP (hdim → context_channels)")
+        print(f"  Dropout: {getattr(args, 'dropout', 0.0)}")
+        print(f"{'='*70}\n")
+
     cfg = VFSDDPMConfig(
         image_size=args.image_size,
         in_channels=args.in_channels,
@@ -28,6 +44,9 @@ def select_model_jax(args, rng: jax.Array) -> Tuple[Dict[str, Any], Dict[str, An
         encoder_tokenize_mode=getattr(args, "encoder_tokenize_mode", "stack"),
         encoder_use_mlp_head=getattr(args, "encoder_use_mlp_head", False),
         encoder_mlp_head_hidden_dim=getattr(args, "encoder_mlp_head_hidden_dim", 512),
+        # Projection head (auto-enabled when pretrained + freeze)
+        use_projection_head=use_projection_head,
+        projection_hidden_dim=projection_hidden_dim,
         hidden_size=args.hidden_size,
         depth=args.depth,
         num_heads=args.num_heads,

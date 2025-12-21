@@ -1253,11 +1253,24 @@ def main():
             pbar = tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch")
             for batch in pbar:
                 batch_np = numpy_from_torch(batch)
-                
-                # CRITICAL: Normalize batch to cfg.sample_size BEFORE train_step
-                # This ensures JAX only compiles ONE version (not multiple for different ns)
-                # Keep as jnp for efficient device transfer
-                batch_jnp = fix_set_size(jnp.array(batch_np), cfg.sample_size)
+
+                # OPTION 3: Accept dynamic ns from dataset (like PyTorch)
+                # Dataset creates sample_size + 1, we use all samples
+                batch_jnp = jnp.array(batch_np)
+
+                # Update cfg.sample_size on first batch to match dataset
+                if global_step == 0:
+                    actual_ns = batch_jnp.shape[1]
+                    if actual_ns != cfg.sample_size:
+                        logger.log(f"\n{'='*70}")
+                        logger.log(f"⚠️  SAMPLE SIZE MISMATCH DETECTED:")
+                        logger.log(f"  CLI config (--sample_size): {cfg.sample_size}")
+                        logger.log(f"  Dataset returns: {actual_ns} samples")
+                        logger.log(f"  Updating cfg.sample_size → {actual_ns} (accepting dataset's ns)")
+                        logger.log(f"  Note: Dataset adds +1 to sample_size (this matches PyTorch behavior)")
+                        logger.log(f"{'='*70}\n")
+                        # Update cfg to match dataset
+                        cfg.sample_size = actual_ns
                 
                 if use_single_device:
                     # Single device: no sharding needed
@@ -1726,7 +1739,7 @@ def create_argparser():
         model="vfsddpm_jax",
         dataset="cifar100",
         image_size=32,
-        sample_size=6,  # Changed from 5 to 6 to match typical usage
+        sample_size=5,  # Changed from 5 to 6 to match typical usage
         patch_size=8,
         # Optional separate patch sizes (0 = fall back to patch_size)
         encoder_patch_size=0,
@@ -1745,6 +1758,8 @@ def create_argparser():
         # Encoder output head configuration
         encoder_use_mlp_head=False,  # Use MLP head (LayerNorm + MLP) instead of single Dense layer
         encoder_mlp_head_hidden_dim=512,  # Hidden dimension for MLP head (if enabled)
+        # Projection head for pretrained encoder adaptation (auto-enabled when pretrained + freeze)
+        projection_hidden_dim=0,  # Hidden dim for projection MLP (0 = same as context_channels)
         context_channels=448,  # Match with hidden_size (must be divisible by 4)
         mode_context="deterministic",
         mode_conditioning="film",

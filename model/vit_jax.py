@@ -99,6 +99,7 @@ class ViT(nn.Module):
     hierarchical_patch_embedding: bool = False  # chưa dùng, chỉ để tương thích
     use_mlp_head: bool = False  # Sử dụng MLP head thay vì chỉ 1 Dense layer
     mlp_head_hidden_dim: int = 512  # Hidden dimension cho MLP head
+    use_time_conditioning: bool = True  # Enable time token (k=2). Set False for pretrained weights (k=1)
 
     def setup(self):
         ih, iw = pair(self.image_size)
@@ -109,7 +110,10 @@ class ViT(nn.Module):
         self.patch_height, self.patch_width = ph, pw
 
         self.num_patches = (ih // ph) * (iw // pw)
-        self.k = 2  # cls + t
+        # k = number of special tokens (cls + optional time)
+        # For pretrained weights without time conditioning: k=1 (only cls)
+        # For training with time conditioning: k=2 (cls + t)
+        self.k = 1 if not self.use_time_conditioning else 2
 
         # linear cho patch + thời gian
         self.to_patch_embedding = nn.Dense(self.dim)
