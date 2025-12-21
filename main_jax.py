@@ -1044,10 +1044,6 @@ def main():
             encoder_lr=args.encoder_lr,
             dit_lr=args.dit_lr,
         )
-    
-    print(f"RSS after jit(train_step): {rss_gb():.2f} GB")
-    print(f"   ⚠️  Note: Actual JIT compilation happens on first call (step 0)")
-    print(f"{'='*70}\n")
 
     # Initialize InceptionV3 for FID computation (if enabled)
     inception_fn = None

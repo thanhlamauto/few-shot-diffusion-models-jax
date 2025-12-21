@@ -398,25 +398,31 @@ class DiT(nn.Module):
             t_emb = t_emb + y_emb
 
         # Prepare conditioning based on mode:
-        # - film mode: conditioning = t_emb + c (for AdaLN)
+        # - film mode: conditioning = concat([t_emb, c]) then project (like UNet)
         # - lag mode: conditioning = t_emb (for AdaLN in blocks, but we won't use AdaLN in lag mode)
         #            context = c (for cross-attention)
         if self.mode_conditioning == "film":
-            # Film mode: use AdaLN with c
-            # Create Dense layer unconditionally (required for Flax @nn.compact)
-            context_proj_layer = nn.Dense(
-                self.hidden_size, kernel_init=nn.initializers.xavier_uniform()
+            # Film mode: CONCATENATE t_emb and c (like UNet), then project
+            # This avoids magnitude mismatch issues from simple addition
+
+            # Create projection layer unconditionally (required for Flax @nn.compact)
+            # Projects from (hidden_size + context_channels) back to hidden_size
+            concat_proj_layer = nn.Dense(
+                self.hidden_size,
+                kernel_init=nn.initializers.xavier_uniform()
             )
+
             if c is not None:
-                context_proj = context_proj_layer(c)
-                conditioning = t_emb + context_proj
+                # Concatenate [t_emb, c] along feature dimension
+                # t_emb: (batch, hidden_size), c: (batch, context_channels)
+                concat_emb = jnp.concatenate([t_emb, c], axis=-1)  # (batch, hidden_size + context_channels)
+                conditioning = concat_proj_layer(concat_emb)  # (batch, hidden_size)
             else:
                 # MUST call layer with dummy input to initialize parameters
-                # AND add the zero projection to maintain consistent computation graph
-                dummy_c = jnp.zeros(
-                    (x.shape[0], self.context_channels), dtype=x.dtype)
-                zero_context_proj = context_proj_layer(dummy_c)
-                conditioning = t_emb + zero_context_proj  # FIX: consistent with c!=None case
+                # AND use zero context to maintain consistent computation graph
+                dummy_c = jnp.zeros((x.shape[0], self.context_channels), dtype=x.dtype)
+                concat_emb = jnp.concatenate([t_emb, dummy_c], axis=-1)
+                conditioning = concat_proj_layer(concat_emb)
         else:
             # Lag mode: only use t_emb for conditioning (but blocks won't use AdaLN)
             # c will be passed as context for cross-attention

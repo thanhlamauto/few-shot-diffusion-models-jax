@@ -11,4 +11,6 @@
 - variational FSDM cho kết quả tệ hơn
 - c là “hằng số theo timestep”
 
+
+
 - Hướng sửa số 2 là chỉnh AdaLN sang Cross-Attention
